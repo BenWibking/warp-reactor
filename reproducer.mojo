@@ -3203,9 +3203,9 @@ def jac_nuc(state: BurnState, mut jac: MatTensor, X: SpeciesTensor, z: Float64):
     var x372_0 = x208_1*x222_1
     var x373_0 = 2*x209_1*x221_1
     var x374_0 = (1.0/2.0)*x220_1*((((
-       0
+       0.0
     )) if truthy((x204_1)) else ((
-       1
+       1.0
     ))))
     var x375_0 = powi_m3(x0_14)
     var x376_0 = (1.0/2.0)*x219_1
@@ -3295,12 +3295,12 @@ def jac_nuc(state: BurnState, mut jac: MatTensor, X: SpeciesTensor, z: Float64):
        x282_0
     ))))))))))
     var x420_0 = ((((
-       0
+       0.0
     )) if truthy((x174_1)) else ((
        ((((
-          0
+          0.0
        )) if truthy((x173_1)) else ((
-          1
+          1.0
        ))))
     ))))*((((
        1.0e-10
@@ -3521,9 +3521,9 @@ def jac_nuc(state: BurnState, mut jac: MatTensor, X: SpeciesTensor, z: Float64):
     var x504_0 = x102_2*x8_14
     var x505_0 = 1.0*x104_2*(2.9933606208922598*x101_2*x8_14 - 7.460375701300709*x504_0*x99_2)
     var x506_0 = ((((
-       0
+       0.0
     )) if truthy((x167_1)) else ((
-       1
+       1.0
     ))))*((((
        0.0001
     )) if truthy((x167_1)) else ((
@@ -3971,7 +3971,6 @@ def integrate_ros2s(mut y: VecTensor, rtol_vec: VecTensor, atol_vec: VecTensor, 
     var nsing = 0
     var hacc = 0.0
     var erracc = 1.0
-    var hopt = h
     var x = 0.0
     var n_step = 0
     var n_accept = 0
@@ -3984,7 +3983,6 @@ def integrate_ros2s(mut y: VecTensor, rtol_vec: VecTensor, atol_vec: VecTensor, 
         if last:
             return Success
 
-        hopt = h
         if x + h * 1.0001 >= tout:
             h = tout - x
             last = True
