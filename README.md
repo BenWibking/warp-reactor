@@ -24,6 +24,12 @@ CPU build:
 c++ -std=c++20 -O3 -I. reproducer.cpp -o reproducer
 ```
 
+Mojo CPU build:
+
+```bash
+pixi run mojo build reproducer.mojo -o reproducer_mojo -Xlinker -lm
+```
+
 CUDA build with the default project settings:
 
 ```bash
@@ -43,6 +49,22 @@ Run the CPU reproducer:
 ```bash
 ./reproducer
 ```
+
+Run the Mojo CPU reproducer:
+
+```bash
+./reproducer_mojo --grid 1 --no-compare-final-state
+```
+
+Compare C++ and Mojo transcendental functions over sampled Float64 inputs:
+
+```bash
+pixi run probe-transcendentals
+```
+
+This probe samples across the full Float64 exponent range, edge cases, focused
+neighborhoods, and random bit patterns. It is not an exhaustive enumeration of
+all legal Float64 values.
 
 Run the CUDA reproducer:
 

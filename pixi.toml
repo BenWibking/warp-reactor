@@ -6,6 +6,9 @@ platforms = ["linux-64"]
 version = "0.1.0"
 
 [tasks]
+build-mojo = "mojo build reproducer.mojo -o reproducer_mojo -Xlinker -lm"
+run-mojo-grid1 = { cmd = "./reproducer_mojo --grid 1 --no-compare-final-state", depends-on = ["build-mojo"] }
+probe-transcendentals = "python3 tools/transcendental_probe.py"
 
 [dependencies]
 mojo = ">=1.0.0b2,<2"
