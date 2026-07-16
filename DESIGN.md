@@ -133,19 +133,42 @@ configuration as the autotuning surface, type-enforced component boundaries.
   `block_dim = NUM_WARPS * WARP_SIZE`.
 - **Lane ↔ cell**: for all bulk evaluation (DAG slices), lane *l* handles
   cell *l* of the tile.
-- **Lockstep substepping**: every iteration of the substep loop executes
-  exactly one ROS2S trial step (J → LU → k₁ → k₂ → k₃ → error) for every
-  active lane, with per-lane `h` and per-lane accept/reject. Cells that
-  finished (reached `tout` or failed) mask off; the tile loop runs until all
-  cells in the tile finish. Each lane's trial-step sequence is deterministic
-  given its own state, so per-cell trajectories match sequential execution
-  (up to reduction reassociation, allowed by tolerance-PASS).
+- **Unified tile controller (decided 2026-07-16)**: the whole tile advances
+  with a **single ROS2S step controller and a single `h`** — no per-cell
+  controller state and no lane masking. Every substep iteration executes one
+  ROS2S trial step (J → LU → k₁ → k₂ → k₃ → error) for all lanes.
+  - Per-cell horizons are preserved: driver setup computes each cell's
+    `dt_cell` from its density driver (as in `advance_collapse_step`); the
+    tile-level time `x` is shared, and each lane's effective step is the
+    derived scalar
+    `h_lane = (dt_cell - x > 0) ? min(h_tile, dt_cell - x) : h_tile`.
+    The commit of `ynew→y` is gated on `dt_cell - x > 0`. Frozen cells are
+    still evaluated (stale-but-valid state, no divergence) but excluded from
+    the tile error max and the LU-singular retry trigger.
+  - Step acceptance: `err_tile = max over non-frozen cells of err_cell`;
+    accept iff `err_tile ≤ 1`, else reject and scale `h_tile` down. The
+    Gustafsson controller (`hacc`/`erracc`) operates on `err_tile`.
+  - Convergence: tile loop runs while `max(dt_cell - x) > 0` — computed in
+    the same per-substep CTA reduction round as `err_tile`.
+  - LU-singular retry, `DT_UNDERFLOW`, `TOO_MANY_STEPS` become tile-level
+    conditions with the same semantics (≤5 halvings, `max_steps`).
+  - Saved vs per-cell control: per-cell `h, hacc, erracc, hopt, x, tout,
+    reject, nsing, n_step, n_accept` (~12 scalars/cell, ≈4 KB shared plus
+    register traffic) collapse to one tile-level set held in registers;
+    no accept/active flags, no unfinished-cell counters.
+  - Numerical effect: every cell integrates with `h ≤` what its own
+    controller would choose, so per-cell trajectories are *more* accurate
+    than the per-cell-adaptive reference, never less. Final states at the
+    horizons remain within harness tolerances (tolerance-PASS covers the
+    trajectory difference). Per-cell integrator stats lose their
+    min/median/max spread (all non-frozen cells share the tile's step
+    counts) — informational only.
 - The phase schedule per substep is **data-independent** ⇒ static schedule ⇒
   deadlock-free (Singe Theorem 1).
 - **Cell ownership**: warp *w* additionally owns cells
   `{w, w+8, w+16, w+24}` (v1: 4 cells/warp) for all per-cell sequential work:
-  LU factorization, triangular solves, state derivation, step control,
-  collapse-driver bookkeeping.
+  LU factorization, triangular solves, state derivation, per-cell error
+  norms and commit gating, collapse-driver bookkeeping.
 
 ### 4.2 Phase schedule (one kernel launch = one global collapse step)
 
@@ -153,18 +176,21 @@ configuration as the autotuning surface, type-enforced component boundaries.
    time, density_driver, completed_steps, stats) global→shared.
 1. **Driver setup** (owner warps, per owned cell): deterministic perturbation
    if scheduled for this global step; density-driver update and density
-   rescale; build integrator state y[15] (number densities + e); set
-   `tout = t + dt`. Mirrors `advance_collapse_step` in `reproducer.cpp`.
+   rescale; build integrator state y[15] (number densities + e); compute the
+   per-cell horizon `dt_cell` from the density driver; reset the tile-level
+   substep time `x = 0` and controller history (`hacc`/`erracc`). Mirrors
+   `advance_collapse_step` in `reproducer.cpp`.
 2. **Substep loop** (until all cells finish or a failure):
    - **P0 state-derive** (owner warps): floor xn, `eos_re` → write per-cell
      X[14] and T to shared for their owned cells. (Reused by J and k₁ RHS.)
    - **P1 Jacobian** (all warps, lane↔cell): each warp evaluates its slice of
      the 1,394-temporary J DAG for all TILE cells, writing its J entries to
      the shared J staging buffer in batches of `NUM_WARPS` cells.
-     Owner warps then, per owned cell: form E = (1/(hγ))I − J from staging,
-     warp-cooperative LU (§4.4) → factors in the warp's registers.
-     LU-retry semantics (singular matrix ⇒ h /= 2, ≤5 retries) are
-     owner-warp-local, exactly as in the sequential code.
+      Owner warps then, per owned cell: form E = (1/(h_lane·γ))I − J from
+      staging, warp-cooperative LU (§4.4) → factors in the warp's registers.
+      LU-retry is tile-level: if any non-frozen cell's factorization is
+      singular, `h` halves and the tile retries (≤5), same semantics as the
+      sequential per-cell retry.
    - **P2 k₁**: all warps evaluate RHS DAG slices (rhs_specie + rhs_eint,
      281 temporaries) → ydot[15] to shared; owner warps solve k₁ = E⁻¹ydot,
      form `ynew = y + a21·k1`, `ak2 = (c21/h)·k1`.
@@ -174,10 +200,12 @@ configuration as the autotuning surface, type-enforced component boundaries.
    - **P4 k₃ + step control**: owners derive X/T from ynew → shared; all
      warps RHS slices; owners solve k₃ (into work), form
      `ynew = y + b1·k1 + b2·k2 + b3·k3`, `err = e1·k1 + e2·k2 + e3·k3`;
-     per-cell weighted error norm (warp reduction), accept/reject and new `h`
-     with the existing Gustafsson controller — all owner-warp-local.
-   - **P5 tile convergence**: shared flag/counter of unfinished cells;
-     `barrier()`; loop.
+     per-cell weighted error norm (warp reduction, frozen cells contribute
+     0), then a CTA-wide max-reduction → `err_tile`; **one** tile-level
+     accept/reject + Gustafsson `h` update; owner warps commit `ynew→y`
+     only for cells with `dt_cell - x > 0`.
+   - **P5 tile convergence**: fused with the P4 reduction round — loop
+     while `max(dt_cell - x) > 0`; `barrier()`; loop.
 3. **Epilogue** (owner warps): floor+normalize, `balance_charge`, `eos_re`,
    update time/density_driver/completed_steps/stats per owned cell;
    `CellStateIO` stores shared→global; tile-level reduction of
@@ -185,8 +213,9 @@ configuration as the autotuning surface, type-enforced component boundaries.
 
 Notes:
 
-- Per-cell `dt` for the collapse step (from the free-fall driver) is
-  per-lane; no cross-cell coupling anywhere except the tile loop count.
+- Per-cell `dt_cell` for the collapse step (from the free-fall driver) is
+  per-lane and enters only as the per-lane horizon in `h_lane` (§4.1); the
+  substep controller itself is tile-level.
 - The three RHS evaluations per substep are the *same code* — no
   instruction-cache divergence across k-stages.
 - X/T shared buffers are double-buffered or sequenced by `barrier()`; v1
@@ -241,9 +270,9 @@ Shared memory per CTA (v1, TILE=32, Neqs=15):
 | ydot staging (32 × 15) | 3.84 KB |
 | X/T state buffers (32 × ~18) | ~4.6 KB |
 | Cell BurnState + collapse fields | ~6 KB |
-| ROS2S control state per cell (h, reject, erracc, hacc, nsing, n_step, n_accept, x, tout) | ~4 KB |
+| Tile-level ROS2S controller (h, hacc, erracc, x, n_step, ...) | <1 KB |
 | Sync counters/flags | <1 KB |
-| **Total** | **≈ 33 KB** (gfx90a limit 64 KB; sm_90 limit 228 KB) |
+| **Total** | **≈ 30 KB** (gfx90a limit 64 KB; sm_90 limit 228 KB) |
 
 Registers per lane (uniform allocation):
 
@@ -254,9 +283,10 @@ Registers per lane (uniform allocation):
 | DAG slice transients (during P1/P2–P4) | ~40–80 live |
 | **Target** | **≤128** (2 CTAs/SM); hard cap 168 |
 
-`y`, `k1`, `k2`, `work`, ROS2S control state live in shared (cheap,
-infrequently indexed); only LU factors and slice transients live in
-registers.
+`y`, `k1`, `k2`, `work` live in shared (cheap, infrequently indexed); only
+LU factors and slice transients live in registers. The step controller is a
+single tile-level scalar set (unified controller, §4.1) — replicated in
+lanes or broadcast from one shared slot — so it costs no per-cell storage.
 
 ### 4.6 Synchronization design (TilePipeline)
 
@@ -330,10 +360,10 @@ struct WarpLuOp[cfg: ChemConfig](TrivialRegisterPassable):
 ```
 
 ```mojo
-# Ros2sStepOp (TileOp) — per-cell step control in owner warps
+# Ros2sStepOp (TileOp) — tile-level step control; per-cell error norms in owner warps
 struct Ros2sStepOp[cfg: ChemConfig](TrivialRegisterPassable):
-    def error_norm(self, cell_slot: Int, ctrl: SharedControl) -> Float64: ...
-    def accept_or_reject(mut self, cell_slot: Int, ctrl: SharedControl, err: Float64): ...
+    def error_norm(self, cell_slot: Int, ctrl: SharedControl) -> Float64: ...  # frozen cells -> 0
+    def tile_accept_or_reject(mut self, err_tile: Float64): ...                # one h for the tile
 ```
 
 ```mojo
@@ -406,7 +436,7 @@ run only on the Linux+GPU machine; everything else runs on CPU anywhere.
 | T3 | `test_warp_lu.mojo` | unit | GPU | warp-cooperative LU+solve vs CPU LU on random + near-singular 15×15 systems (tolerance) |
 | T4 | `test_structured_kernel_grid1.mojo` | integration | GPU | warp-specialized kernel grid-1 final state ≈ CPU reference |
 | T5 | `test_structured_kernel_grid64.mojo` | e2e | GPU | grid-64 final-state comparison harness PASS (tolerance) + wall-time/spill metrics recorded |
-| T6 | `test_lockstep_equivalence.mojo` | integration | GPU | tile-lockstep substep trajectories ≈ per-cell sequential trajectories (tolerance) on a small grid with forced divergent h paths |
+| T6 | `test_unified_controller.mojo` | integration | GPU | unified-controller tile run ≈ per-cell sequential reference final states (tolerance) on a small grid with heterogeneous `dt_cell` horizons (forces cells to freeze at different substeps) |
 
 Existing harness reused: final-state binary comparison
 (`final_states_grid64_*.bin`, PASS/FAIL + CSV), integrator stats counters,
@@ -445,8 +475,13 @@ overlap, constant striping across lanes (Singe §5.2), warp indexing
 Allowed to differ from the CPU reference within harness tolerances:
 
 - Reduction order in error norm, EOS sums, density sums, pivot search.
-- Idle-lane masking artifacts (must be none — masked lanes must not write
-  shared or global state).
+- The unified tile controller: per-cell trajectories follow the tile's `h`
+  (≤ what per-cell adaptivity would choose), so final states differ from the
+  per-cell-adaptive reference at most by the improved local accuracy; final
+  states at the horizons must remain within harness tolerances.
+- Frozen cells (`dt_cell - x ≤ 0`) are evaluated but never committed, and
+  contribute 0 to the tile error max. Frozen cells must not write shared or
+  global state.
 
 Must NOT change:
 
@@ -468,7 +503,7 @@ Must NOT change:
 | Register overshoot (>128) | occupancy 1 CTA/SM | move state vectors to shared (already planned), reduce CELLS_PER_WARP to 2 (NUM_WARPS=16), raise exchange threshold τ |
 | Mojo stdlib missing named barriers | none for v1 | FullBarrierSync only needs `barrier()`; verify mbarrier API in M0 for v2 |
 | Slicer mis-parses generated code | wrong results | T2 bitwise test is exact and cheap; run in CI on every regeneration |
-| Lockstep divergence: cells with very different substep counts waste lanes | moderate | same waste exists per-warp today at warp granularity; optional future re-binning of cells into tiles by progress |
+| Unified-controller cost: the tile advances at the pace of the *worst* cell's error estimate every substep (reject-if-any) | more substeps than per-cell adaptivity | same worst-cell-of-32 waste exists today via warp divergence in the thread-per-cell build; keep tiles homogeneous (perturbation-driven heterogeneity is modest); optional future re-binning of cells into tiles by progress |
 
 ## 11. Reference commands
 
@@ -513,3 +548,4 @@ pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
 | 2026-07-16 | Tolerance-PASS acceptable; bitwise identity not required | Ben |
 | 2026-07-16 | Milestone order M1→M5 (baseline first, then slicer, then structured kernel) | Ben |
 | 2026-07-16 | Dev on macOS; GPU compile/test only on Linux+GPU machine (Metal lacks Float64) | environment constraint |
+| 2026-07-16 | Unified tile-level timestep controller (single h, accept-if-all-accept, frozen cells not committed); no per-cell controller state, no lane masking | Ben |
