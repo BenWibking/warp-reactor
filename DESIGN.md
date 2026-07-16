@@ -1,8 +1,8 @@
 # Design: Warp-Specialized Mojo GPU Chemistry Kernel
 
-Status: **approved design, not yet implemented**
+Status: **approved direction; implementation and GPU feasibility gates pending**
 Date: 2026-07-16
-Authors: Ben Wibking + OpenCode session
+Authors: Ben Wibking + design review sessions
 
 This document is the complete, self-contained plan for rewriting the
 primordial-chemistry reproducer (`reproducer.mojo` / `reproducer.cpp`) as a
@@ -16,22 +16,47 @@ other context.
 ## 1. Goal and non-goals
 
 **Goal.** Replace the current thread-per-cell GPU integration with a
-warp-specialized kernel in which a CTA of *W* warps cooperates on a tile of
-cells, eliminating the register spilling that dominates the current GPU
-builds, while keeping the CPU and existing GPU entry points intact.
+warp-specialized kernel in which `NUM_WARPS` warps cooperate on a tile of
+cells. The structured kernel should eliminate compiler-reported spills if the
+toolchain permits it, and in all cases must reduce private-memory traffic and
+beat the data-parallel Mojo GPU baseline before it becomes the default. The CPU
+and existing C++ GPU entry points remain intact.
 
-**Numerics policy (decided).** *Tolerance-PASS* against the existing
-final-state comparison harness is acceptable. Bitwise identity with the CPU
-reference is **not** required. Reductions (error norm, EOS sums, pivot
-searches) may reassociate.
+**Numerics policy (decided).** *Tolerance-PASS* using the existing packed-file
+comparison schema/tolerances and a newly generated grid-wide-policy CPU
+reference is acceptable. Bitwise identity with the CPU reference is **not**
+required. Error-norm and EOS reductions may reassociate.
 
 **Non-goals (v1).**
 
-- No changes to the chemistry, EOS, or ROS2S numerics themselves.
+- No changes to the chemistry RHS/Jacobian, EOS, ROS2S coefficients,
+  tolerances, or step-controller formulas. The grid-wide outer timestep and
+  CTA-wide coupling of error estimates are intentional driver/controller
+  changes.
 - No CUDA/HIP rewrite (the C++ paths stay as-is; Mojo GPU is the new path).
-- No persistent-megakernel driver; keep one kernel launch per global collapse
-  step, matching the current CUDA driver structure.
+- No persistent-megakernel driver. V1 uses one short grid-timestep prepass and
+  one chemistry kernel launch per global collapse step, with a host reduction
+  between them.
 - No producer/consumer overlap (v2); v1 uses full-CTA phase barriers.
+
+### 1.1 Acceptance gates
+
+The design is complete only when all four gates have evidence from the target
+machines:
+
+1. **Correctness**: T0--T8 pass; the GPU output passes the packed final-state
+   comparator against the new grid-wide CPU policy reference; partial tiles,
+   stopped cells, singular retries, and no-active-cell termination are covered.
+2. **Resources**: both sm_90 and gfx90a builds report static shared memory,
+   registers, spills, and private/local bytes. The v1 shared layout is at most
+   48 KiB per CTA. Zero spills is the target; any exception must be explicit,
+   measured, and still satisfy the performance gate.
+3. **Performance**: on every backend where M4 is proposed as the default, its
+   grid-64 wall time is lower than M1 under the same driver policy, inputs, and
+   measurement protocol. Otherwise M1 remains the default on that backend.
+4. **Portability**: configuration assertions pass for both 32-lane NVIDIA
+   warps and 64-lane AMD CDNA wavefronts, and the GPU test suite has no
+   out-of-bounds or barrier-divergence failures.
 
 ## 2. Background
 
@@ -85,10 +110,11 @@ From Modular's blog series ("Structured Mojo Kernels" parts 1–2):
   NVIDIA, shared-memory atomic counters + spin-wait (`s_sleep 0` yield) on
   AMD. Only the first thread of each warp increments counters.
 - **TileOp** owns compute, incl. register/accumulator lifecycle.
-- `TileTensor` is the common currency; warp roles are comptime-selected;
-  context managers (`with producer.acquire() as tiles:`) make incorrect
-  synchronization unrepresentable; everything is comptime-parameterized for
-  autotuning.
+- `TileTensor` is the common currency; configuration and component composition
+  are comptime-selected, while runtime `warp_id` branches select roles
+  uniformly within each warp. Context managers
+  (`with producer.acquire() as tiles:`) pair acquire/release transitions;
+  full-CTA barrier uniformity still requires an explicit audit.
 
 We adopt the pattern (these are pattern names, not library APIs) and the
 practices: trait-based sync, context-manager acquire/release, comptime
@@ -103,9 +129,10 @@ configuration as the autotuning surface, type-enforced component boundaries.
   `LLVM ERROR: Failed to verify LLVM IR for Metal`. All GPU compile+test
   steps must run on the Linux+GPU machine. CPU unit tests run anywhere.
 - GPU targets: NVIDIA sm_90 and AMD gfx90a (per README). `WARP_SIZE` is
-  comptime in Mojo: 32 on NVIDIA, 64 on AMD CDNA. The design uses
-  `comptime WARP_SIZE` throughout; v1 accepts idle lanes on wave64
-  (see §8 risks).
+  comptime in Mojo: 32 on NVIDIA, 64 on AMD CDNA. V1 fixes the *logical* tile
+  at 32 cells on both backends and uses `WARP_SIZE` only for physical launch
+  geometry and warp primitives. This keeps ownership and storage identical;
+  v1 intentionally leaves extra AMD lanes idle (see §10 risks).
 - Mojo GPU essentials (from the mojo-gpu-fundamentals skill):
   kernels are plain `def` (no decorator), launched with
   `ctx.enqueue_function[kernel](args, grid_dim=..., block_dim=...)`;
@@ -127,166 +154,323 @@ configuration as the autotuning surface, type-enforced component boundaries.
 
 ### 4.1 Execution model
 
-- **Tile**: one CTA of `NUM_WARPS = 8` warps (256 threads on NVIDIA)
-  cooperates on `TILE_CELLS = WARP_SIZE` cells (32 on NVIDIA, 64 on AMD).
-  Launch: `grid_dim = ceil(num_cells / TILE_CELLS)`,
-  `block_dim = NUM_WARPS * WARP_SIZE`.
-- **Lane ↔ cell**: for all bulk evaluation (DAG slices), lane *l* handles
-  cell *l* of the tile.
-- **Unified tile controller (decided 2026-07-16)**: the whole tile advances
-  with a **single ROS2S step controller and a single `h`** — no per-cell
-  controller state and no lane masking. Every substep iteration executes one
-  ROS2S trial step (J → LU → k₁ → k₂ → k₃ → error) for all lanes.
-  - Per-cell horizons are preserved: driver setup computes each cell's
-    `dt_cell` from its density driver (as in `advance_collapse_step`); the
-    tile-level time `x` is shared, and each lane's effective step is the
-    derived scalar
-    `h_lane = (dt_cell - x > 0) ? min(h_tile, dt_cell - x) : h_tile`.
-    The commit of `ynew→y` is gated on `dt_cell - x > 0`. Frozen cells are
-    still evaluated (stale-but-valid state, no divergence) but excluded from
-    the tile error max and the LU-singular retry trigger.
-  - Step acceptance: `err_tile = max over non-frozen cells of err_cell`;
-    accept iff `err_tile ≤ 1`, else reject and scale `h_tile` down. The
+- **V1 configuration**: `NUM_WARPS = 8`, `TILE_CELLS = 32`,
+  `BATCH_CELLS = NUM_WARPS = 8`, and `BATCHES_PER_TILE = 4` on both
+  backends. Launch with `grid_dim = ceil(num_cells / TILE_CELLS)` and
+  `block_dim = NUM_WARPS * WARP_SIZE` (256 threads on NVIDIA, 512 on AMD).
+  Compile-time checks require `TILE_CELLS % BATCH_CELLS == 0`,
+  `BATCH_CELLS == NUM_WARPS`, `Neqs <= WARP_SIZE`, and a device-valid block
+  size.
+- **Device state layout**: use field-major structure-of-arrays storage, not a
+  raw `CollapseState` or one untyped tensor. The logical `DeviceCells` bundle
+  contains `Float64` state fields (`rho`, `T`, `e`, `xn[14]`, `time`,
+  `density_driver`), an `Int32 completed_steps` buffer, and seven `UInt64`
+  statistics fields. Adjacent lanes therefore load adjacent cells for each
+  field, and integer metadata is never round-tripped through `Float64`. The
+  packed 172-byte C++ record is a host serialization format, not a device
+  layout. M1 determines whether Mojo can pass the logical bundle directly or
+  whether kernels take its tensors as separate arguments.
+- **Batch mapping**: a complete ROS2S trial is evaluated in four batches. In
+  batch *b*, DAG-slice lane *l* handles tile cell
+  `b * BATCH_CELLS + l` for `l < BATCH_CELLS`; other lanes contribute neutral
+  values but follow the same control flow. Owner warp *w* factors and solves
+  exactly cell `b * BATCH_CELLS + w`. This batching is deliberate: it bounds
+  J staging and lets a warp retain only one cell's factors through k1--k3.
+  It is a storage/execution schedule only: every batch evaluates the same
+  shared `(x, h)`, and no batch advances or commits before the tile decision.
+- **Grid-wide physical timestep (decided 2026-07-16)**: every participating
+  cell in the grid advances through the same outer interval `dt_grid` during a
+  global collapse step.
+  - A preparation kernel applies the scheduled perturbation exactly once,
+    computes each participating cell's free-fall proposal
+    `dt_candidate = tff_reduc * tff`, excludes already-stopped cells and cells
+    with `dt_candidate < 10`, and writes one `(minimum, global_cell_id)` pair
+    per chemistry tile (`(+inf, INT_MAX)` when none participates). Bounds-only
+    lanes are neutral. A non-finite/non-positive density, `tff`, or candidate
+    is a failure, not a silently excluded cell. A cell stopped by the local
+    `dt_candidate < 10` condition receives the same terminal density-driver
+    update as the existing driver before it is frozen.
+  - The host copies the per-CTA pairs, performs a stable lexicographic
+    reduction by `(dt_candidate, global_cell_id)`, and sets
+    `dt_grid = min(dt_candidate)` over the whole active grid. It skips the
+    chemistry launch when no finite candidate remains. For a 64^3 grid and
+    32-cell tiles this is 8,192 minima (64 KiB of `Float64`) plus 32 KiB of
+    cell IDs per outer step. A device reduction may replace it later without
+    changing the numerical policy or tie-breaking. The host checks the
+    preparation failure flag before reducing or launching chemistry.
+    Both device and host use the same comparator:
+    `(a.dt < b.dt) or (a.dt == b.dt and a.cell < b.cell)` after finite-value
+    validation.
+  - In the chemistry kernel, each participating cell recomputes `tff` from the
+    prepared state and updates
+    `density_driver += dt_grid * density_driver / tff`. Thus the cell that
+    sets the minimum advances its driver by at most `tff_reduc`, and every
+    other cell advances by a smaller fraction of its local free-fall time.
+    Cells whose common update crosses the existing density-driver stop limit
+    are marked stopped before the burn and excluded from the controllers.
+    The preparation-pass active set defines `dt_grid` for the current step;
+    the minimum is not recomputed if one of those cells then crosses the
+    density-driver limit during setup. That cell is absent from the next
+    preparation pass.
+  - There is no persistent stopped flag and no per-cell timestep buffer. Setup
+    recomputes the local `dt_candidate < 10` predicate. Such cells are neutral
+    for chemistry because the preparation kernel already performed their one
+    terminal driver update; setup must not update them a second time. A cell
+    that stops on the density-driver limit receives its common driver update
+    in setup but, matching the existing driver, no density rescale or burn.
+    Both kernels call the same device helper for density, `tff`, and
+    `dt_candidate`, preventing a threshold-rounding mismatch between passes.
+  - The host computes `next_grid_time = grid_time + dt_grid` once. Every cell
+    that is actually integrated commits `collapse.time = next_grid_time`
+    directly, rather than accumulating per-cell sums. Consequently all cells
+    participating in a completed global step end at the same representable
+    physical time. Previously stopped cells remain frozen and do not rejoin.
+    The host assigns `grid_time = next_grid_time` and increments
+    `completed_global_steps` exactly once only after the chemistry launch
+    reports no failure and at least one integrated cell. Every
+    participating cell must enter preparation with
+    `completed_steps == completed_global_steps` and
+    `collapse.time == grid_time` exactly; a mismatch is an invariant failure.
+    If all remaining cells stop during setup, the host terminates without
+    advancing `grid_time`.
+- **Unified CTA controller (decided 2026-07-16)**: each CTA advances its
+  participating cells from `x = 0` to `tout = dt_grid` with a **single ROS2S
+  step controller and a single physical substep `h`**. There is no per-cell
+  horizon or controller state. A validity/participation mask is still required
+  for partial CTAs and stopped cells, but it never changes the barrier path.
+  Every substep iteration executes one ROS2S trial step
+  (J → LU → k₁ → k₂ → k₃ → error) for all participating lanes.
+  - Step acceptance: `err_tile = max over participating cells of err_cell`;
+    accept iff `err_tile ≤ 1`, else reject and scale the common `h` down. The
     Gustafsson controller (`hacc`/`erracc`) operates on `err_tile`.
-  - Convergence: tile loop runs while `max(dt_cell - x) > 0` — computed in
-    the same per-substep CTA reduction round as `err_tile`.
+  - Final-step truncation is common to the CTA:
+    `h = min(h, dt_grid - x)`. On acceptance every participating cell commits;
+    an accepted final step assigns `x = dt_grid` exactly, while other accepted
+    steps use `x += h`. This avoids lane- or cell-dependent horizon tests.
   - LU-singular retry, `DT_UNDERFLOW`, `TOO_MANY_STEPS` become tile-level
-    conditions with the same semantics (≤5 halvings, `max_steps`).
+    conditions with the same semantics (fail on the fifth singular
+    factorization, so at most four retry halvings; unchanged `max_steps`).
   - Saved vs per-cell control: per-cell `h, hacc, erracc, hopt, x, tout,
     reject, nsing, n_step, n_accept` (~12 scalars/cell, ≈4 KB shared plus
-    register traffic) collapse to one tile-level set held in registers;
-    no accept/active flags, no unfinished-cell counters.
-  - Numerical effect: every cell integrates with `h ≤` what its own
-    controller would choose, so per-cell trajectories are *more* accurate
-    than the per-cell-adaptive reference, never less. Final states at the
-    horizons remain within harness tolerances (tolerance-PASS covers the
-    trajectory difference). Per-cell integrator stats lose their
-    min/median/max spread (all non-frozen cells share the tile's step
-    counts) — informational only.
-- The phase schedule per substep is **data-independent** ⇒ static schedule ⇒
-  deadlock-free (Singe Theorem 1).
-- **Cell ownership**: warp *w* additionally owns cells
-  `{w, w+8, w+16, w+24}` (v1: 4 cells/warp) for all per-cell sequential work:
-  LU factorization, triangular solves, state derivation, per-cell error
-  norms and commit gating, collapse-driver bookkeeping.
+    register traffic) collapse to one tile-level shared set, cached or
+    broadcast uniformly as needed.
+    Participating cells within a CTA share step counts; different CTAs may
+    choose different ROS2S substep sequences while still reaching the same
+    grid-wide outer time.
+  - Numerical effect: the grid-wide outer timestep and maximum-error CTA
+    controller change trajectories relative to independent per-cell
+    adaptivity. No monotonic accuracy claim is made; final states must satisfy
+    the comparison harness tolerances.
+- The grid-wide reduction applies only to the outer collapse interval.
+  Synchronizing every ROS2S trial across CTAs would require a grid-wide
+  reduction inside each adaptive substep and is explicitly out of scope.
+- All threads execute the same phase/barrier sequence. Validity and
+  participation masks guard arithmetic and memory accesses, never barriers.
+- **Cell ownership**: across the tile, warp *w* owns cells
+  `{w, w+8, w+16, w+24}`. It processes only one of them in each complete
+  batch trial, including LU, three solves, state derivation, candidate/error
+  production, and collapse bookkeeping. Candidate state is staged until the
+  CTA-level decision; rejected or singular trials never overwrite base `y`.
 
-### 4.2 Phase schedule (one kernel launch = one global collapse step)
+### 4.2 Driver and phase schedule (one global collapse step)
+
+Before the chemistry kernel:
+
+The host clears `failure` and `integrated_count` for the step. The preparation
+kernel overwrites every per-CTA pair slot, including empty tiles, so no value
+from a previous global step can participate in the reduction.
+
+0. **Grid-timestep preparation kernel**: apply the deterministic perturbation
+   once for this global step; honor `completed_steps`/valid-cell gating;
+   compute `dt_candidate`; apply the terminal update and exclude local
+   `dt_candidate < 10` stops; reduce remaining candidates to one
+   `(minimum, lowest_global_cell_id)` pair per chemistry tile. Report invalid
+   physics through the failure buffer. Launch exactly one preparation CTA per
+   logical chemistry tile with `block_dim = WARP_SIZE`; lanes 0..31 map to the
+   tile's cells and any wider-wave lanes are neutral.
+1. **Host reduction**: copy the per-CTA pairs, compute the stable global pair,
+   and stop the global loop if all entries are `+inf`. Pass the finite
+   `grid_time`, `next_grid_time = grid_time + dt_grid`, and `dt_grid` to every
+   CTA in the chemistry launch. Abort before launch if preparation reported
+   invalid physics, `dt_grid <= 0`, or `next_grid_time` is non-finite.
+
+Inside the chemistry kernel:
 
 0. **Load**: `CellStateIO` loads the tile's cell states (ρ, T, e, xn[14],
    time, density_driver, completed_steps, stats) global→shared.
-1. **Driver setup** (owner warps, per owned cell): deterministic perturbation
-   if scheduled for this global step; density-driver update and density
-   rescale; build integrator state y[15] (number densities + e); compute the
-   per-cell horizon `dt_cell` from the density driver; reset the tile-level
-   substep time `x = 0` and controller history (`hacc`/`erracc`). Mirrors
-   `advance_collapse_step` in `reproducer.cpp`.
-2. **Substep loop** (until all cells finish or a failure):
-   - **P0 state-derive** (owner warps): floor xn, `eos_re` → write per-cell
-     X[14] and T to shared for their owned cells. (Reused by J and k₁ RHS.)
-   - **P1 Jacobian** (all warps, lane↔cell): each warp evaluates its slice of
-     the 1,394-temporary J DAG for all TILE cells, writing its J entries to
-     the shared J staging buffer in batches of `NUM_WARPS` cells.
-      Owner warps then, per owned cell: form E = (1/(h_lane·γ))I − J from
-      staging, warp-cooperative LU (§4.4) → factors in the warp's registers.
-      LU-retry is tile-level: if any non-frozen cell's factorization is
-      singular, `h` halves and the tile retries (≤5), same semantics as the
-      sequential per-cell retry.
-   - **P2 k₁**: all warps evaluate RHS DAG slices (rhs_specie + rhs_eint,
-     281 temporaries) → ydot[15] to shared; owner warps solve k₁ = E⁻¹ydot,
-     form `ynew = y + a21·k1`, `ak2 = (c21/h)·k1`.
-   - **P3 k₂**: owner warps derive X/T from ynew → shared; barrier; all warps
-     RHS slices at (x + ct2·h, ynew); owners solve k₂, form
-     `ynew = y + a31·k1 + a32·k2`, `work = (c31·k1 + c32·k2)/h`.
-   - **P4 k₃ + step control**: owners derive X/T from ynew → shared; all
-     warps RHS slices; owners solve k₃ (into work), form
-     `ynew = y + b1·k1 + b2·k2 + b3·k3`, `err = e1·k1 + e2·k2 + e3·k3`;
-     per-cell weighted error norm (warp reduction, frozen cells contribute
-     0), then a CTA-wide max-reduction → `err_tile`; **one** tile-level
-     accept/reject + Gustafsson `h` update; owner warps commit `ynew→y`
-     only for cells with `dt_cell - x > 0`.
-   - **P5 tile convergence**: fused with the P4 reduction round — loop
-     while `max(dt_cell - x) > 0`; `barrier()`; loop.
-3. **Epilogue** (owner warps): floor+normalize, `balance_charge`, `eos_re`,
-   update time/density_driver/completed_steps/stats per owned cell;
-   `CellStateIO` stores shared→global; tile-level reduction of
-   `all_stopped`/`failure_code` into the existing global atomics.
+1. **Driver setup** (owner warps, per owned cell): recompute `tff` from the
+   prepared state and first exclude local-`dt<10` cells without touching their
+   already-updated driver. For the remaining cells, update the density driver
+   with common `dt_grid`; cells crossing the density-driver limit stop before
+   density rescale/burn. For actual participants, apply the density rescale and
+   build integrator state y[15] (number densities + e). Reset CTA substep time
+   `x = 0`, set `tout = h = dt_grid`, and reset controller history
+   (`hacc`/`erracc`). The perturbation is not repeated here.
+2. **Substep loop** (until the CTA controller reaches `dt_grid` or fails):
+   reset the shared singular flag and candidate-error slots, then execute the
+   following complete trial for batches `b = 0..3`. The batch loop and all
+   early-exit decisions are CTA-uniform.
+   - **P0 base state** (owner warp *w* handles cell `8*b+w`): derive floored
+     X[14] and T from the immutable base `y`, and write the batch X/T buffer.
+   - **P1 Jacobian + LU** (all warps then owners): lanes 0..7 evaluate their
+     warp's generated J slice for the eight batch cells and fill the
+     8×225 J stage. Owner warp *w* loads column-owned
+     `E = (1/(h*gamma))I - J` for its one cell and factors it in registers.
+     A CTA reduction publishes `batch_singular`. If set, every thread skips
+     the remaining work/batches, the controller halves `h`, discards all
+     candidates, and retries the whole tile. `nsing` is CTA-level and persists
+     across the outer integration, matching the scalar code: the fifth
+     singular factorization fails before another halving.
+   - **P2 k1**: the generated RHS slices fill the 8×15 ydot stage; each owner
+     solves with its retained LU factors and forms the first stage state and
+     `k2` seed in batch scratch.
+   - **P3 k2**: owners derive batch X/T from the first stage state; generated
+     RHS slices evaluate it; owners solve and form the second stage state plus
+     `work`.
+   - **P4 k3 + candidate**: repeat X/T and RHS evaluation; owners solve k3,
+     form the candidate and embedded error, write the candidate to the
+     full-tile candidate buffer, and write one scalar error per cell. LU
+     factors are now dead and may be released before the next batch.
+3. **CTA decision**: after all four batches complete, reduce
+   `err_tile = max(err_cell)` over participating cells. Apply the unchanged
+   ROS2S/Gustafsson formulas once to that scalar. A non-finite participating
+   error is a tile failure. On rejection, retain base `y`, update the common
+   `h`, and rerun all batches. On acceptance, owner warps copy every
+   participating candidate to base `y`, advance the shared `x`, and truncate
+   the next `h` to the remaining common horizon.
+4. **Epilogue** (owner warps): on successful completion, floor+normalize,
+   `balance_charge`, `eos_re`, set `time = next_grid_time`, update
+   `completed_steps = completed_global_steps + 1`, and update stats for
+   participating cells. Cells stopped during setup store only their prescribed
+   driver/stop state. A failed tile does not mark cells integrated or advance
+   their time. `CellStateIO` applies those commit masks shared→global, then
+   publishes `integrated_count` and `failure_code` through global atomics.
 
 Notes:
 
-- Per-cell `dt_cell` for the collapse step (from the free-fall driver) is
-  per-lane and enters only as the per-lane horizon in `h_lane` (§4.1); the
-  substep controller itself is tile-level.
+- `dt_grid` is identical in every CTA for a global collapse step, but each CTA
+  owns an independent ROS2S error controller and may use a different sequence
+  of accepted substeps to reach that common horizon.
+- Cells excluded by bounds, prior stopping, or the density-driver limit take
+  neutral roles in reductions and never read/write out of bounds. They still
+  execute every CTA barrier.
 - The three RHS evaluations per substep are the *same code* — no
   instruction-cache divergence across k-stages.
-- X/T shared buffers are double-buffered or sequenced by `barrier()`; v1
-  uses `barrier()` between all phases (FullBarrierSync).
+- Base `y` is immutable for the entire tile trial. Candidate and stage buffers
+  are separate, so CTA-wide rejection and singular retry are transactional.
+- X/T and other batch scratch are sequenced by `barrier()`; v1 uses
+  `barrier()` between all producer/consumer phases (FullBarrierSync).
+- Any chemistry failure is terminal for the global run. Other CTAs may already
+  have committed when the host observes the failure; v1 does not promise a
+  grid-wide rollback or restartable failed state, and it never advances
+  `grid_time` or writes a comparison result after such a failure.
 
 ### 4.3 DAG slicing (Singe "buffer" mode)
 
-The J DAG (1,394 temporaries, 225 outputs) and RHS DAG (281 temporaries,
-15 outputs) are emitted by the code generator in topological order
-(`var xN_0 = <expr>`), so contiguous ranges are valid convex partitions.
-The `tools/slice_dag.py` generator (§6) assigns each output to a warp
-(J: row-blocks ⇒ ~28–29 entries/warp; RHS: ~2 outputs/warp), pulls in the
-temporaries each output transitively needs, and applies Singe's
-recompute-vs-exchange rule:
+The source contains three generated scopes: `rhs_specie` (119 temporaries,
+14 outputs), `rhs_eint` (162 temporaries, one returned output), and `jac_nuc`
+(1,394 temporaries, 225 outputs). Temporary identifiers are of the form
+`x<integer>_<integer>` (the suffix is not always `_0`), and many assignments
+and outputs span multiple lines. The generator (§6) parses complete statements,
+builds an explicit dependency graph, and verifies that source order is
+topological; it does not infer convexity from line ranges.
+
+For each 8-cell batch, every warp evaluates one generated slice across lanes
+0..7. The generator assigns outputs to warps (J: balanced row groups; combined
+RHS: balanced outputs), pulls in each output's transitive dependencies, and
+applies Singe's recompute-vs-exchange rule:
 
 - **Recompute** a shared subexpression in every warp that needs it when its
   subtree is cheap (pure arithmetic on already-shared values).
 - **Exchange** expensive shared subexpressions — the transcendental families
   (`exp(a·log|T|)`, `exp(-a/T)`, `log`, `sqrt`, polynomial-in-log(T) powers):
-  computed once per substep in a pre-pass and staged through shared memory.
+  computed once per batch evaluation/region and staged through shared memory.
 
-Slice code is emitted as ordinary Mojo functions with the same expression
-text as the monolithic DAG (per-temporary op order unchanged ⇒ slice
-evaluation is bitwise-identical to monolithic on CPU, which the slicer's
-unit test asserts).
+Slice code is emitted as ordinary Mojo functions with the same expression text
+as the monolithic DAG. Each temporary is evaluated at most once per slice and
+all exchanged values cross a barrier before consumption. The CPU oracle checks
+bitwise identity for each J/RHS output, while GPU integration uses the final
+tolerance policy.
+
+Runtime `warp_id` dispatch means the aggregate instruction footprint includes
+all generated paths. M2 therefore measures generated source/IR size and an
+otherwise-identical 2/4/6/8-path dispatch microbenchmark before M4. The
+generator must be able to split long slices into bounded regions with
+CTA-uniform reconvergence points. If eight paths show instruction-fetch
+regression, the fallback order is: rebalance/recompute to shorten regions,
+split J into more reconvergent regions, then use a smaller feasible
+`NUM_WARPS`. Eight long paths are not assumed safe without measurement.
 
 ### 4.4 Warp-cooperative LU and solves (owner warps)
 
 Per owned cell, 15×15 LU with partial pivoting (LINPACK-style, matching
 `lu_decomposition`/`lu_solve` in `reproducer.cpp:96-181`):
 
-- Lane *c* ∈ [0,15) owns column *c* (15 doubles). Lanes 15..WARP_SIZE-1 idle
-  in v1 (v2: process 2–4 cells concurrently per warp using 30/45/60 lanes).
-- Pivot search: ordered scan of |E[i][k]|, i ≥ k, via `warp.shuffle` —
-  tolerance-PASS permits any valid pivot choice; keep sequential
-  first-strict-max tie-breaking anyway since it costs nothing.
-- Row swap: shuffle exchange. Multipliers and Schur update: data-parallel
-  across the 15 active lanes.
-- LU factors (L unit-diagonal implied, U, ipvt) stay in the warp's registers:
-  15 doubles/lane/cell ⇒ **60 registers/lane for 4 owned cells**. Never
-  written to shared or global memory.
+- During one batch, lane *c* in [0,15) owns matrix column *c* for exactly one
+  cell and holds its 15 row values. Lanes 15..`WARP_SIZE-1` are neutral in v1.
+- At elimination step *k*, lane *k* performs the ordered local scan of
+  `abs(E[i,k])`, `i >= k`, using first-strict-max tie-breaking, then broadcasts
+  the pivot row. For each active trailing column `c >= k`, lane *c* swaps its
+  own row-*k* and row-*pivot* values. No row-owned shuffle exchange is needed.
+- Lane *k* forms the signed LINPACK multipliers in column *k*. For each
+  trailing row, it broadcasts that multiplier; lanes `c > k` apply the Schur
+  update to their local column value. The algorithm therefore has one
+  consistent column-ownership model for pivoting, swapping, and elimination.
+- Each lane retains its column (15 `Float64` values) and its distributed pivot
+  metadata through all three solves. The solve vector is distributed one
+  component per active lane. At step *k*, lane *k* broadcasts the pivot index;
+  `x[pivot]` is gathered from lane *pivot* for the swap. Lane *k* then
+  broadcasts the needed `LU[j,k]` value for each affected component *j*, and
+  lane *j* applies its forward/back-substitution update. The same factors serve
+  k1, k2, and k3, then die before the next batch.
+- `InlineArray` is a storage expression, not proof of register allocation.
+  Compiler resource reports and spill counts are the acceptance evidence.
 - Forward/back substitution (`lu_solve`): lane-cooperative with broadcasts;
   used 3× per substep (k₁, k₂, k₃), reusing the same factors.
 
 ### 4.5 Data placement budget
 
-Shared memory per CTA (v1, TILE=32, Neqs=15):
+V1 uses a project cap of 48 KiB static shared memory per CTA, leaving a single
+portable budget rather than depending on a backend-specific large-shared-memory
+opt-in. The conservative layout budget is:
 
-| Buffer | Size |
-|---|---|
-| J staging (8-cell batch × 225 doubles) | 14.4 KB |
-| ydot staging (32 × 15) | 3.84 KB |
-| X/T state buffers (32 × ~18) | ~4.6 KB |
-| Cell BurnState + collapse fields | ~6 KB |
-| Tile-level ROS2S controller (h, hacc, erracc, x, n_step, ...) | <1 KB |
-| Sync counters/flags | <1 KB |
-| **Total** | **≈ 30 KB** (gfx90a limit 64 KB; sm_90 limit 228 KB) |
+| Buffer | Formula | Bytes |
+|---|---:|---:|
+| J staging | `8 * 225 * 8` | 14,400 |
+| Base `y` for the tile | `32 * 15 * 8` | 3,840 |
+| Uncommitted candidate `y` | `32 * 15 * 8` | 3,840 |
+| Batch vectors (stage-y, ydot, k1, k2, work/error) | `5 * 8 * 15 * 8` | 4,800 |
+| Batch X/T inputs | at most `8 * 16 * 8` | 1,024 |
+| Collapse metadata, stats, masks | budget | 4,096 |
+| Generated DAG exchange arena | hard budget | 8,192 |
+| Controller, reductions, sync flags | budget | 1,024 |
+| **Subtotal before padding/alignment** |  | **41,216 (40.25 KiB)** |
 
-Registers per lane (uniform allocation):
+`SmemLayout` is the source of truth: it computes aligned offsets and exposes a
+comptime total. Kernel configuration validation rejects totals above 48 KiB.
+The slicer emits its exact exchange-arena requirement; if it exceeds 8 KiB,
+the generator must recompute more expressions, rebalance slices, or reject the
+configuration. The table counts base state only once and includes all trial
+vectors; there is no hidden full-tile `BurnState` allocation.
 
-| Use | Budget |
-|---|---|
-| LU factors (4 cells × 15) | 60 |
-| State vectors held transiently during solves (y/ynew/k1/k2/work) | ~20 |
-| DAG slice transients (during P1/P2–P4) | ~40–80 live |
-| **Target** | **≤128** (2 CTAs/SM); hard cap 168 |
+Private/register placement is measured rather than estimated as a hard
+occupancy promise:
 
-`y`, `k1`, `k2`, `work` live in shared (cheap, infrequently indexed); only
-LU factors and slice transients live in registers. The step controller is a
-single tile-level scalar set (unified controller, §4.1) — replicated in
-lanes or broadcast from one shared slot — so it costs no per-cell storage.
+- During LU, each active lane has 15 `Float64` factor values for one cell
+  (roughly 30 32-bit vector-register allocation units before metadata and
+  compiler temporaries), not four cells' factors.
+- Batch state vectors and all accept/reject candidates live in shared memory.
+  DAG slice temporaries and the current LU column are intended to remain
+  private and short-lived.
+- Physical register accounting, occupancy, spills, and private/local bytes come
+  from the sm_90/gfx90a compiler reports. M3 records the LU-only report; M4
+  records the full-kernel report. No source-level `InlineArray` assumption or
+  guessed register cap substitutes for those reports.
+
+The grid-timestep prepass additionally allocates global/host scratch for one
+`Float64` minimum and one `Int32` cell ID per chemistry tile. This is outside
+the CTA shared-memory budget. No per-cell timestep buffer is required: the
+chemistry kernel recomputes `tff` from the prepared state.
 
 ### 4.6 Synchronization design (TilePipeline)
 
@@ -300,15 +484,16 @@ trait SyncStrategy(TrivialRegisterPassable):
 ```
 
 - **v1: `FullBarrierSync`** — `phase_barrier()` = `barrier()`; producer/
-  consumer ops also map to `barrier()`. Static phase schedule makes this
-  correct by construction.
+  consumer ops also map to `barrier()`. The phase schedule is static, and
+  tests/audit must verify that masks and failure flags never bypass a barrier.
 - **v2: `CounterSync`** — shared-memory atomic counters per stage with
   spin-wait (`Atomic.load` loop; first thread of each warp increments;
   on AMD emit `s_sleep 0` via `inlined_assembly` to yield), following the
   blog's AMD `SyncStrategy` design. Enables producer/consumer overlap
   (e.g. J slice production for batch b+1 overlapping LU of batch b).
-- All acquire/release wrapped in context managers
-  (`with stage.acquire() as buf:`) so unpaired sync is unrepresentable.
+- Acquire/release transitions are wrapped in context managers
+  (`with stage.acquire() as buf:`) to prevent accidental unpaired stage
+  transitions. This does not replace the CTA-uniform control-flow audit.
 
 ## 5. Structured components (Mojo interface sketches)
 
@@ -320,11 +505,23 @@ mojo-syntax skill: `def` only, `comptime`, `Self.`-qualified params,
 # ChemConfig — the comptime autotuning surface (Singe §4)
 struct ChemConfig:
     comptime NUM_WARPS = 8
-    comptime TILE_CELLS = WARP_SIZE          # 32 NVIDIA / 64 AMD
-    comptime CELLS_PER_WARP = TILE_CELLS // NUM_WARPS  # 4
-    comptime Sync = FullBarrierSync          # v2: CounterSync
-    comptime J_SLICE = jac_slice_tables      # from tools/slice_dag.py
+    comptime TILE_CELLS = 32                 # logical cells on both backends
+    comptime BATCH_CELLS = Self.NUM_WARPS    # one current cell per owner warp
+    comptime BATCHES_PER_TILE = Self.TILE_CELLS // Self.BATCH_CELLS
+    comptime MAX_SHARED_BYTES = 48 * 1024
+    comptime MAX_EXCHANGE_BYTES = 8 * 1024
+    comptime Sync = FullBarrierSync           # v2: CounterSync
+    comptime J_SLICE = jac_slice_tables       # from tools/slice_dag.py
     comptime RHS_SLICE = rhs_slice_tables
+
+def validate_config[cfg: ChemConfig]():
+    comptime assert cfg.TILE_CELLS == 32
+    comptime assert cfg.TILE_CELLS % cfg.BATCH_CELLS == 0
+    comptime assert cfg.BATCH_CELLS == cfg.NUM_WARPS
+    comptime assert cfg.BATCH_CELLS <= WARP_SIZE
+    comptime assert Neqs <= WARP_SIZE
+    comptime assert cfg.NUM_WARPS * WARP_SIZE <= 1024
+    comptime assert SmemLayout[cfg].BYTES <= cfg.MAX_SHARED_BYTES
 ```
 
 ```mojo
@@ -332,19 +529,19 @@ struct ChemConfig:
 struct CellStateIO[cfg: ChemConfig](TrivialRegisterPassable):
     def load(
         self,
-        global_cells: TileTensor[DType.float64, ...],
-        ref[AddressSpace.SHARED] smem: SmemLayout,
+        global_cells: DeviceCells,
+        mut smem: SmemLayout,
         tile_idx: Int,
     ): ...
     def store(self, ...) -> None: ...
 ```
 
 ```mojo
-# DagSliceOp (TileOp) — evaluate this warp's slice, lane <-> cell
+# DagSliceOp (TileOp) — evaluate this warp's slice over one 8-cell batch
 struct DagSliceOp[cfg: ChemConfig, table: SliceTable](TrivialRegisterPassable):
-    def eval(
+    def eval_batch(
         self,
-        xt: SharedXT,            # per-cell X[14], T from shared
+        xt: SharedXT,            # batch X[14], T from shared
         mut out: SharedStage,    # J or ydot staging
         warp_id: Int, lane: Int,
     ): ...
@@ -353,54 +550,95 @@ struct DagSliceOp[cfg: ChemConfig, table: SliceTable](TrivialRegisterPassable):
 ```mojo
 # WarpLuOp (TileOp) — owner-warp LU + solves for owned cells
 struct WarpLuOp[cfg: ChemConfig](TrivialRegisterPassable):
-    var factors: InlineArray[Float64, 60]   # 4 cells x 15 columns
-    var ipvt: InlineArray[Int, 60]
-    def factorize(mut self, cell_slot: Int, fac: Float64, j_stage: SharedStage) -> Int: ...
-    def solve(self, cell_slot: Int, mut x: SharedVec): ...
+    var column: InlineArray[Float64, Neqs]  # one column of one current cell
+    var pivot_row: Int                     # distributed: meaningful in lane k
+    def factorize(mut self, fac: Float64, j_stage: SharedStage) -> Int: ...
+    def solve(self, mut x: SharedVec): ...
 ```
 
 ```mojo
 # Ros2sStepOp (TileOp) — tile-level step control; per-cell error norms in owner warps
 struct Ros2sStepOp[cfg: ChemConfig](TrivialRegisterPassable):
-    def error_norm(self, cell_slot: Int, ctrl: SharedControl) -> Float64: ...  # frozen cells -> 0
-    def tile_accept_or_reject(mut self, err_tile: Float64): ...                # one h for the tile
+    def error_norm(self, cell_slot: Int, ctrl: SharedControl) -> Float64: ...
+    def tile_accept_or_reject(mut self, err_tile: Float64): ...
 ```
 
 ```mojo
-# Kernel skeleton — role dispatch is comptime-gated, phases are data-independent
-def chem_collapse_kernel[cfg: ChemConfig](
-    cells: TileTensor[DType.float64, ...], num_cells: Int,
+# Grid-timestep prepass — perturb once and emit one minimum/cell pair per CTA
+def prepare_grid_timestep_kernel[cfg: ChemConfig](
+    cells: DeviceCells, num_cells: Int,
+    completed_global_steps: Int, grid_time: Float64,
     step: Int, perturb: Bool,
-    all_stopped: UnsafePointer[Int32], failure: UnsafePointer[Int32],
+    cta_dt_min: TileTensor[DType.float64, ...],
+    cta_min_cell: TileTensor[DType.int32, ...],
+    failure: UnsafePointer[Int32, MutAnyOrigin],
 ):
+    ...
+
+# Chemistry kernel — every CTA receives the same outer dt_grid
+def chem_collapse_kernel[cfg: ChemConfig](
+    cells: DeviceCells, num_cells: Int,
+    completed_global_steps: Int, grid_time: Float64,
+    next_grid_time: Float64, dt_grid: Float64,
+    integrated_count: UnsafePointer[Int32, MutAnyOrigin],
+    failure: UnsafePointer[Int32, MutAnyOrigin],
+):
+    validate_config[cfg]()
     var warp_id = thread_idx.x // WARP_SIZE
     var lane = thread_idx.x % WARP_SIZE
     ref smem = ...  # shared layout from cfg
     var sync = cfg.Sync(smem)
     CellStateIO[cfg]().load(cells, smem, block_idx.x)
-    driver_setup[cfg](smem, warp_id, lane, step, perturb)
-    while tile_has_unfinished_cells(smem):
-        state_derive[cfg](smem, warp_id, lane)
+    sync.phase_barrier()
+    driver_setup[cfg](
+        smem, warp_id, lane, completed_global_steps, grid_time, dt_grid
+    )
+    sync.phase_barrier()
+    while controller_running(smem):  # one CTA-uniform shared predicate
+        begin_trial[cfg](smem, warp_id, lane)
         sync.phase_barrier()
-        jac_phase[cfg](smem, warp_id, lane)     # slices + owner LU
+        comptime for batch in range(cfg.BATCHES_PER_TILE):
+            run_complete_batch[cfg, batch](smem, warp_id, lane)
+        finish_trial[cfg](smem, warp_id, lane)  # singular retry or max-error decision
         sync.phase_barrier()
-        rhs_solve_phase[cfg](smem, warp_id, lane, stage=1)
-        rhs_solve_phase[cfg](smem, warp_id, lane, stage=2)
-        rhs_solve_phase[cfg](smem, warp_id, lane, stage=3)
-        step_control_phase[cfg](smem, warp_id, lane)
-        sync.phase_barrier()
-    epilogue[cfg](smem, warp_id, lane)
+    epilogue[cfg](
+        smem, warp_id, lane, completed_global_steps, next_grid_time
+    )
+    sync.phase_barrier()
     CellStateIO[cfg]().store(cells, smem, block_idx.x)
 ```
+
+Every function that indexes a `TileTensor` must include the appropriate
+`comptime assert tensor.flat_rank == N`; the ellipses above intentionally omit
+concrete layouts and origins until M1 establishes them on both GPU backends.
 
 ## 6. `tools/slice_dag.py` (generator tool)
 
 **Input**: the machine-generated DAG functions in `reproducer.mojo`
 (`rhs_specie`, `rhs_eint`, `jac_nuc`).
 
-**Parse**: each `var xN_0 = <expr>` line; dependencies = `xM_0` tokens in
-`<expr>` plus external inputs (`vget(X, i)`, `T`, `state.*`). Outputs =
-`vset(ydot, i, ...)` / `mset(jac, i, j, ...)` / `return <expr>` statements.
+**Parse contract**:
+
+1. Locate the three function bodies by name and indentation; names are scoped
+   per function.
+2. Collect complete Mojo statements with delimiter balancing, so multiline
+   conditional expressions and multiline `mset`/`return` outputs remain
+   intact. Recognize definitions matching `x[0-9]+_[0-9]+`; never assume the
+   suffix is `_0` or that an assignment occupies one line.
+3. Tokenize identifiers and build dependency edges to definitions in the same
+   function. Whitelist external inputs/calls (`T`, `z`, `state.*`, `vget`,
+   math helpers, constants); reject unresolved generated identifiers, duplicate
+   definitions, cycles, use-before-definition, or unsupported statements. IR
+   keys are `(function_name, temporary_name)` so the independent
+   `rhs_specie`/`rhs_eint` namespaces cannot collide; generated slice helpers
+   remain separately scoped (or use deterministic function prefixes).
+4. Recognize all `vset(ydot, ...)`, `mset(jac, ...)`, and returned expressions
+   as outputs, including multiline forms. Pin the current manifest at
+   119/14 (`rhs_specie`), 162/1 (`rhs_eint`), and 1,394/225 (`jac_nuc`), so a
+   regenerated network causes an intentional review rather than silent drift.
+5. Preserve each expression's source text and stable source order. Embed the
+   input-file hash and generator options in generated-file headers; two runs
+   with identical inputs must have byte-identical output.
 
 **Partition** (greedy, Singe §4.1 metrics — FLOP balance, register pressure,
 locality):
@@ -411,17 +649,26 @@ locality):
 3. Temporaries claimed by ≥2 warps: mark **exchange** if subtree cost
    (FLOP-weighted; exp/log/cbrt weighted ~20–30) exceeds threshold τ,
    else **recompute** in each claiming warp. τ is a comptime-tunable knob.
-4. Emit per-warp Mojo functions preserving the original expression text and
-   per-temporary order, plus comptime exchange tables (which temporaries go
-   to shared, in topo order).
+4. Emit per-warp Mojo functions preserving expression text/order, comptime
+   exchange tables (shared temporaries in topological order), and optional
+   bounded dispatch regions with CTA-uniform reconvergence.
 
-**Output**: `slices_jac.mojo`, `slices_rhs.mojo`, and a CPU validation
-driver `test_slice_dag.mojo`.
+**Output**: `slices_jac.mojo`, `slices_rhs.mojo`, Python parser/generator tests
+in `tests/test_slice_dag.py`, and a Mojo numerical validation driver in
+`tests/test_slice_dag.mojo`. Also emit a machine-readable report containing
+per-warp outputs, weighted operations, estimated peak live temporaries,
+recomputed/exchanged nodes, exact exchange bytes, dispatch-region sizes, and
+generated source bytes. M2 rejects any configuration above the 8 KiB exchange
+budget before GPU compilation.
 
-**CPU unit test** (runs anywhere): for fixed representative inputs, sliced
-evaluation must be **bitwise identical** to the monolithic functions
-(same ops, same order per temporary). This test must exist and fail before
-the slicer is written (TDD).
+**CPU unit tests** (run anywhere): parser fixtures cover multiline assignments,
+nonzero suffixes, malformed/unresolved references, and manifest drift. Sliced
+evaluation must be **bitwise identical** to the monolithic functions over fixed
+fixtures, deterministic log-scaled random states, and a reviewed branch-case
+manifest. That manifest supplies `nextafter` neighbors where a condition maps
+to a temperature threshold, and branch instrumentation proves that both sides
+of every generated conditional execute somewhere in the corpus. These tests
+must fail before the parser/slicer is written (TDD).
 
 ## 7. Testing plan (TDD)
 
@@ -431,57 +678,123 @@ run only on the Linux+GPU machine; everything else runs on CPU anywhere.
 
 | # | Test | Type | Where | Asserts |
 |---|---|---|---|---|
-| T1 | `test_gpu_dataparallel_final_state.mojo` | e2e | GPU | thread-per-cell Mojo GPU port, grid-1 final state matches CPU Mojo within tolerance |
-| T2 | `test_slice_dag.mojo` | unit | CPU | sliced J/RHS eval bitwise-equal to monolithic on representative inputs (incl. T thresholds: T<2, ≤10, ≤30, ≤50, ≤100, ≤1000, ≤1160, ≤2000, ≤6000, ≤10000, >10000; X floors) |
-| T3 | `test_warp_lu.mojo` | unit | GPU | warp-cooperative LU+solve vs CPU LU on random + near-singular 15×15 systems (tolerance) |
+| T0 | `test_grid_timestep_reference.mojo` | unit | CPU | stable `(dt, cell)` minimum, terminal `dt<10` update, density-limit stop, invalid-state failure, no-active termination, common density update, and exact common output time |
+| T1 | `test_gpu_dataparallel_final_state.mojo` | e2e | GPU | one-thread-per-cell-trial Mojo baseline with the grid-timestep prepass and common CTA controller; grid-1 final state matches CPU Mojo within tolerance |
+| T2 | `tests/test_slice_dag.py` + `.mojo` | unit | CPU | Python parser tests reject malformed/drifted input and prove deterministic generation; Mojo sliced J/RHS is bitwise-equal to monolithic on fixtures/log-random/X-floor cases, with reviewed `nextafter` cases and two-sided generated-branch coverage |
+| T3 | `test_warp_lu.mojo` | unit | GPU | column-owned LU+solve vs CPU LU on identity, exact-singular, forced-row-swap, pivot-tie, random, and near-singular 15×15 systems; residual/backward-error bounds hold |
 | T4 | `test_structured_kernel_grid1.mojo` | integration | GPU | warp-specialized kernel grid-1 final state ≈ CPU reference |
-| T5 | `test_structured_kernel_grid64.mojo` | e2e | GPU | grid-64 final-state comparison harness PASS (tolerance) + wall-time/spill metrics recorded |
-| T6 | `test_unified_controller.mojo` | integration | GPU | unified-controller tile run ≈ per-cell sequential reference final states (tolerance) on a small grid with heterogeneous `dt_cell` horizons (forces cells to freeze at different substeps) |
+| T5 | `test_structured_kernel_grid64.mojo` | e2e | GPU | grid-64 output passes the new grid-wide-policy reference comparator; wall time, code/resource data, and spills are recorded |
+| T6 | `test_unified_controller.mojo` | integration | CPU+GPU | CPU/GPU CTA traces agree within tolerance; a rejection or singular LU in any batch discards every batch candidate, retries the whole CTA with one `h`, and all participants finish at `dt_grid` |
+| T7 | `test_gridwide_timestep_multicta.mojo` | integration | GPU | limiter in a nonzero CTA and tied candidates choose the stable global pair; every CTA receives the same `dt_grid`; host time advances only after a successful launch with integrations |
+| T8 | `test_partial_and_stopped_tiles.mojo` | integration | GPU | cell counts 1, 7, 8, 31, 32, and 33 plus mixed prior/during-setup stops have neutral masked lanes, no OOB access, identical barrier traces, and correct candidates/commits |
 
-Existing harness reused: final-state binary comparison
-(`final_states_grid64_*.bin`, PASS/FAIL + CSV), integrator stats counters,
-wall-time output. Extend the README results table with Mojo GPU rows
-(backend=`mojo-gpu`), including spill counts where the toolchain reports
-them.
+The packed comparison *schema and tolerances* from the C++ harness are reused,
+but the legacy `final_states_grid64_cpu.bin` contents are not the reference for
+the changed driver policy. M0 generates an explicitly named grid-wide CPU
+reference (for example `final_states_grid64_cpu_gridwide.bin`) using scalar
+RHS/J/LU code and the same fixed 32-cell CTA grouping. Legacy files are never
+silently overwritten. Serialization must match the
+`#pragma pack(1) PackedFinalState` layout: five little-endian `Int32` fields
+(`cell, i, j, k, completed_steps`) followed by 19 little-endian `Float64`
+fields (`time, density_driver, rho, T, e, xn[0..13]`), with no padding
+(172 bytes/record). M0 includes a byte-for-byte C++↔Mojo round-trip fixture so
+struct-layout assumptions cannot silently enter the file format. The new
+reference also has a sidecar manifest recording cell count, `TILE_CELLS`,
+driver/controller policy version, source hash, Mojo version, and tolerance
+hash. `gridwide-cta32` comparison rejects a missing or mismatched manifest
+rather than using a stale reference accidentally; `legacy-local` may retain
+schema-only compatibility with the existing C++ file.
+
+This harness work is real M0 scope: the current `reproducer.mojo` ignores
+`--no-compare-final-state`, rejects `--compare-final-state` as unimplemented,
+and does not emit packed multi-cell output. Implement the packed writer,
+reader/comparator, PASS/FAIL+CSV reporting, and wall-time/multi-cell summaries
+before T1/T5 claim reuse. T0/T6/T7 use the scalar grid-wide
+driver/controller as the structural oracle. Extend the README results table
+with backend=`mojo-gpu`, compiler resource metrics, prepass/reduction time,
+the min/median/max distribution of finite **CTA minima**, and the limiting cell
+ID.
+
+M0 also makes the CPU CLI policy explicit without changing its existing
+default: add `--driver-policy legacy-local|gridwide-cta32` (default
+`legacy-local`) and `--write-final-state FILE`. Reference generation requires
+`gridwide-cta32`; `--compare-final-state FILE` and
+`--no-compare-final-state` control comparison independently. The GPU
+executables implement only `gridwide-cta32` in v1 and reject any other policy.
+
+**Performance protocol.** M1 and M4 time the same region: immediately before
+the first preparation launch through the final chemistry synchronization,
+including every host minima copy/reduction but excluding initialization,
+reference-file I/O, and comparison. Run one untimed warm-up and report the
+median of at least three grid-64 runs, plus preparation, host-reduction, and
+chemistry subtotals. Record hardware, driver, Mojo version, build flags,
+resource report, and work counters with each result; a wall-time comparison
+without matching policy/input and these counters is not an acceptance result.
 
 ## 8. Milestones (in order)
 
-**M0 — repo prep.** WIP branch `mojo-gpu-warp-spec`; commit pending
-pixi.toml/pixi.lock (osx-arm64 platform); verify pixi env on the GPU
-machine; check `std.gpu.sync` for named-barrier/mbarrier availability and
-record findings in this doc.
+**M0 — repo prep + grid-timestep reference.** Verify the pixi environment on
+the GPU machine; implement the scalar CPU grid-wide timestep/32-cell-controller
+reference, invariant checks, packed I/O/comparator, T0, and the CPU trace half
+of T6. Generate the explicitly named grid-wide grid-64 reference only after
+those tests pass, without replacing the legacy file. Check `std.gpu.sync` for
+named-barrier/mbarrier availability and record findings in this doc, although
+v1 does not depend on it.
 
 **M1 — data-parallel Mojo GPU baseline.** Port `reproducer.mojo` to a
-thread-per-cell GPU kernel reusing the existing scalar functions unchanged
-(LayoutTensor stack allocations, InlineArray, std.math transcendentals are
-expected to compile for GPU — verify). Driver mirrors the CUDA host loop.
-Tests: T1. Record baseline wall time on the GPU machine. **This is the
-performance baseline and the bring-up vehicle for the harness.**
+one-thread-per-cell *trial* kernel: each active thread retains the scalar
+J/LU/state working set, but the 32-cell CTA uses the same common `h`, max-error
+decision, transactional commit, and tile grouping as M4. Reuse scalar
+RHS/J/LU bodies where GPU compilation permits, but split controller phases at
+CTA barriers. Launch one physical warp per baseline CTA
+(`block_dim = WARP_SIZE`, lanes 0..31 map to cells). Add the preparation
+kernel, per-CTA `(minimum, cell)` buffers, host reduction, common density
+update, and time invariants. Tests: T1, T7, T8, and the grid-64 comparator.
+Record wall time, work counters, spills/private bytes, and prepass/reduction
+overhead. **This is the numerically fair performance baseline and the harness
+bring-up vehicle.**
 
-**M2 — DAG slicer.** `tools/slice_dag.py` + generated slices. Test: T2 (CPU).
+**M2 — robust DAG slicer + dispatch feasibility.** Implement
+`tools/slice_dag.py`, generated slices/reports, parser fixtures, and T2. Run the
+2/4/6/8-path instruction-footprint microbenchmark on both GPU backends before
+choosing the final dispatch-region layout. Reject generated configurations
+whose exchange arena exceeds 8 KiB.
 
-**M3 — warp-cooperative LU.** `WarpLuOp` + T3 (GPU).
+**M3 — column-owned LU + batched trial microkernel.** Implement `WarpLuOp`,
+T3, and the four-batch transactional trial path used by T6. Record LU-only and
+trial-microkernel resources on sm_90/gfx90a; do not proceed with a configuration
+that exceeds 48 KiB shared memory, fails partial-tile barriers, or spills the LU
+column by itself.
 
 **M4 — structured warp-specialized kernel.** Assemble components per §4–5
-with `FullBarrierSync`. Tests: T4, T6, then T5. Perf compare vs M1.
+with `FullBarrierSync`. Tests: T4, T6, T7, T8, then T5. Capture both backend
+resource reports and compare wall time/work counters against M1 before changing
+any default.
 
-**M5 — tune.** Comptime sweeps: NUM_WARPS ∈ {4, 8, 16}, τ (recompute vs
-exchange), CTAs/SM, wave32 vs wave64 on AMD. Then optionally `CounterSync`
-overlap, constant striping across lanes (Singe §5.2), warp indexing
-(Singe §5.3), multi-cell-per-warp LU on wave64. Update README table.
+**M5 — tune.** Sweep only configurations that preserve `TILE_CELLS = 32` and
+pass the layout assertions: feasible `NUM_WARPS`/`BATCH_CELLS`, τ (recompute
+vs exchange), dispatch-region size, and CTAs per compute unit. Then optionally
+evaluate `CounterSync` overlap, constant striping across lanes (Singe §5.2),
+warp indexing (Singe §5.3), and logical subwarp/multi-cell LU strategies for
+AMD wave64. Re-run correctness because controller grouping or reduction order
+must not change silently; update the README table.
 
 ## 9. Numerics policy details
 
 Allowed to differ from the CPU reference within harness tolerances:
 
-- Reduction order in error norm, EOS sums, density sums, pivot search.
-- The unified tile controller: per-cell trajectories follow the tile's `h`
-  (≤ what per-cell adaptivity would choose), so final states differ from the
-  per-cell-adaptive reference at most by the improved local accuracy; final
-  states at the horizons must remain within harness tolerances.
-- Frozen cells (`dt_cell - x ≤ 0`) are evaluated but never committed, and
-  contribute 0 to the tile error max. Frozen cells must not write shared or
-  global state.
+- Reduction order in error norm, EOS sums, and density sums. LU uses the same
+  ordered first-strict-max pivot rule, but downstream floating-point values may
+  still differ across CPU/GPU math implementations.
+- The outer driver uses
+  `dt_grid = min_active(tff_reduc * tff)` and applies that same physical
+  interval in every participating cell's density and chemistry update.
+- Each CTA uses the maximum cell error for a common accepted/rejected ROS2S
+  substep sequence. Different CTAs may take different internal sequences but
+  must all finish at the same `dt_grid` horizon before the next global step.
+- Out-of-bounds and stopped cells contribute neutral values to reductions and
+  never commit state. Invalid participating physics is a failure, not a mask.
+  Neither case alters the CTA barrier sequence.
 
 Must NOT change:
 
@@ -489,21 +802,35 @@ Must NOT change:
   enforces bitwise identity on CPU).
 - ROS2S coefficients, controller parameters (`safe`, `fac_min`, `fac_max`,
   `uround`, `max_steps`), tolerance vectors (rtol/atol per component),
-  LU-retry semantics (≤5 halvings), perturbation schedule, density-driver
-  update rule, floor/normalize/balance-charge/eos sequence at step end.
-- The final-state file format and comparison tolerances.
+  LU-retry semantics (failure on the fifth singular factorization),
+  perturbation schedule, the
+  `density_driver += dt*density_driver/tff` rule (with `dt = dt_grid`), and
+  the floor/normalize/balance-charge/eos sequence at step end.
+- Stable outer-minimum tie-breaking by lowest global cell ID; fixed 32-cell CTA
+  grouping in v1; transactional all-batch retry/commit; exact assignment of
+  integrated-cell time from host-computed `next_grid_time`.
+- The final-state file format and comparison tolerances. The explicitly named
+  grid-wide reference contents replace, rather than masquerade as, the legacy
+  independent-timestep reference.
 
 ## 10. Risks and mitigations
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Instruction-cache thrash from 8 structurally-different J slices (Singe §5.1) | severe slowdown | slices are long straight-line code with few-way warp branches (acceptable per Singe); keep phase-level reconvergence; measure early in M4 with NUM_WARPS=2 first |
+| Instruction-cache thrash from 8 structurally different J slices (Singe §5.1) | severe slowdown | M2 measures 2/4/6/8-path dispatch and generated code size; use bounded reconvergent regions, rebalance/recompute, or a smaller feasible warp count before M4 |
 | Barrier overhead on small 15×15 LU (Singe diffusion lost ~15%) | moderate | v1 accepts it; v2 CounterSync + batching overlap |
-| wave64 idle lanes on AMD (lanes 15–63 idle in LU) | moderate | v2: process 2–4 cells/warp concurrently; or compile wave32 kernels on gfx90a (comptime switch) |
-| Register overshoot (>128) | occupancy 1 CTA/SM | move state vectors to shared (already planned), reduce CELLS_PER_WARP to 2 (NUM_WARPS=16), raise exchange threshold τ |
+| Low lane utilization in 8-cell DAG batches and 15-lane LU, especially on AMD wave64 | moderate/severe | accept for correctness-first v1, measure phase timings, then evaluate larger feasible batches or logical-subwarp/multi-cell LU without changing the 32-cell controller group |
+| Register/private-memory overshoot despite batching | low occupancy or spills | retain only one LU column/cell at a time, bound generated regions, tune recompute/exchange, and gate M3/M4 on compiler resource reports rather than source estimates |
+| Shared layout exceeds the portable cap after padding or generated exchanges | build failure or backend-specific opt-in | `SmemLayout.BYTES` comptime assertion, 8 KiB exchange cap, and generator rejection before full compilation |
 | Mojo stdlib missing named barriers | none for v1 | FullBarrierSync only needs `barrier()`; verify mbarrier API in M0 for v2 |
-| Slicer mis-parses generated code | wrong results | T2 bitwise test is exact and cheap; run in CI on every regeneration |
-| Unified-controller cost: the tile advances at the pace of the *worst* cell's error estimate every substep (reject-if-any) | more substeps than per-cell adaptivity | same worst-cell-of-32 waste exists today via warp divergence in the thread-per-cell build; keep tiles homogeneous (perturbation-driven heterogeneity is modest); optional future re-binning of cells into tiles by progress |
+| Slicer mis-parses multiline/generated scopes | wrong results | balanced statement parser, pinned manifest/hash, negative fixtures, and bitwise T2 on every regeneration |
+| Grid-wide minimum is dominated by one outlier cell | more outer collapse steps for the whole grid | this is the intended test-problem policy; report min/median/max over finite copied CTA minima and the limiting cell ID each global step |
+| Preparation kernel + host pair reduction | extra launch, ~96 KiB transfer at grid-64, and synchronization per global step | prioritize an auditable v1 result; measure the isolated overhead in M1 and preserve stable `(dt, cell)` semantics in any later device reduction |
+| Perturbation applied in both preparation and chemistry kernels | incorrect density/state update | preparation owns perturbation exclusively; T7 compares the prepared states and deterministic perturbation factors against the CPU reference |
+| Unified-controller cost: a CTA advances at the pace of its worst cell's error estimate every substep (reject-if-any) | more substeps than per-cell adaptivity | record per-CTA accepted/rejected counts and compare M1 vs M4; tune tile composition only after correctness is established |
+| A singularity discovered after earlier batches produced candidates | partial state update on retry | base `y` is immutable until the one CTA decision; T6 poisons candidate buffers and proves whole-tile discard/retry |
+| One CTA fails after another CTA commits | globally partial failed state | failure is terminal in v1; host does not advance `grid_time` or compare/write final output, and no restart semantics are claimed |
+| Legacy/stale final-state file is mistaken for the new-policy oracle | false failure or accidental baseline replacement | explicit `*_cpu_gridwide.bin` name, checked sidecar manifest, schema-only reuse, and no silent overwrite |
 
 ## 11. Reference commands
 
@@ -518,23 +845,31 @@ pixi run run-mojo-grid1
 c++ -std=c++20 -O3 -I. reproducer.cpp -o reproducer
 ./reproducer --grid 1 --no-compare-final-state
 
-# tests (CPU parts)
-pixi run mojo run test_slice_dag.mojo
+# planned tests (CPU parts, after M0/M2)
+pixi run mojo run test_grid_timestep_reference.mojo
+pixi run python3 -m unittest tests/test_slice_dag.py
+pixi run mojo run tests/test_slice_dag.mojo
+
+# generate the new-policy CPU oracle (after M0)
+./reproducer_mojo --grid 64 --driver-policy gridwide-cta32 \
+  --write-final-state final_states_grid64_cpu_gridwide.bin \
+  --no-compare-final-state
 
 # GPU machine: baseline + structured kernel (after M1/M4)
 pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
 ./reproducer_gpu --grid 1 --no-compare-final-state
-./reproducer_gpu --grid 64          # final-state comparison PASS expected
+./reproducer_gpu --grid 64 \
+  --compare-final-state final_states_grid64_cpu_gridwide.bin
 ```
 
 ## 12. Key file/line pointers
 
 - `reproducer.mojo`: `rhs_specie` L257, `rhs_eint` L442, `jac_nuc` L1019,
-  `lu_decomposition`/`lu_solve` ~L3820–L3887, `integrate_ros2s` L3926,
-  `burn_ros2s` L4064, `make_collapse_state` L4109, main/driver L4150+
-- `reproducer.cpp`: integrator core L1–78, LU L79–186, network L187–7066,
-  ROS2S coefficients L7118, RODAS integrator L7067–7330, collapse driver
-  L7400+, CUDA kernel L7671, CUDA host loop L7694+
+  `lu_decomposition` L3829, `lu_solve` L3864, `integrate_ros2s` L3926,
+  `burn_ros2s` L4064, `make_collapse_state` L4109, main/driver L4253+
+- `reproducer.cpp`: LU L97/L155, ROS2S coefficients L7113, RODAS integrator
+  L7133+, packed record L7481, collapse driver L7621, CUDA/HIP kernel L7671,
+  final-state comparator L8225+, main/host loop L8398+
 - `tools/transcendental_probe.py`: C++ vs Mojo Float64 transcendental
   comparison (use when chasing numerical differences)
 - `README.md`: build/run commands + ROCm results table (extend with
@@ -548,4 +883,9 @@ pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
 | 2026-07-16 | Tolerance-PASS acceptable; bitwise identity not required | Ben |
 | 2026-07-16 | Milestone order M1→M5 (baseline first, then slicer, then structured kernel) | Ben |
 | 2026-07-16 | Dev on macOS; GPU compile/test only on Linux+GPU machine (Metal lacks Float64) | environment constraint |
-| 2026-07-16 | Unified tile-level timestep controller (single h, accept-if-all-accept, frozen cells not committed); no per-cell controller state, no lane masking | Ben |
+| 2026-07-16 | Grid-wide outer physical timestep `dt_grid = min_active(tff_reduc*tff)`; all integrated cells use it for density evolution, chemistry, and physical time | Ben |
+| 2026-07-16 | Unified CTA-level ROS2S controller (single physical `h`, accept-if-all-accept); no per-cell horizons or controller state; only validity/stopped-cell masks remain | Ben |
+| 2026-07-16 | Grid-wide synchronization ends at the outer `dt_grid` horizon; adaptive ROS2S substeps remain CTA-local | Ben |
+| 2026-07-16 | V1 uses a fixed 32-cell logical tile on NVIDIA and AMD; an 8-cell complete-trial batch retains one cell's LU factors per owner warp | design review |
+| 2026-07-16 | Reuse the packed comparison schema/tolerances, but generate an explicitly named CPU reference for the new grid-wide/CTA-controller policy | design review |
+| 2026-07-16 | Reduce stable `(dt_candidate, cell_id)` pairs and assign one host-computed `next_grid_time` to every integrated cell | design review |
