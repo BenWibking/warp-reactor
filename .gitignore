@@ -4,4 +4,13 @@
 
 # local build outputs
 reproducer
-reproducer_*
+reproducer_mojo
+reproducer_cuda
+reproducer_hip
+
+# generated interpreter caches
+__pycache__/
+*.pyc
+
+# comparator diagnostics
+final_state_comparison_failures_mojo.csv
