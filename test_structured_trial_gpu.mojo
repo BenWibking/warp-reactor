@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# ABOUTME: GPU validation driver for the four-batch transactional ROS2S trial.
+# ABOUTME: GPU validation driver for the Hopper single-batch ROS2S trial.
 
 import reproducer
 import structured_ops
@@ -71,7 +71,8 @@ def main() raises:
         Cells,
         h,
         grid_dim=1,
-        block_dim=256,
+        block_dim=structured_ops.BlockThreads,
+        shared_mem_bytes=structured_ops.DynamicSharedBytes,
     )
     ctx.synchronize()
 
@@ -110,4 +111,4 @@ def main() raises:
                             raise Error(
                                 t"cell {cell}: candidate mismatch at {component}: actual={actual}, expected={expected}"
                             )
-    print("PASS: four-batch transactional structured trial")
+    print("PASS: Hopper 32-cell transactional structured trial")

@@ -1,12 +1,11 @@
-# Standalone reproducer for Mojo 1.0.0b2 NVIDIA Float64 sqrt compilation.
+# Standalone regression test for Mojo NVIDIA Float64 sqrt compilation.
 #
 # Reproduce with:
 #   mojo build repro_nvidia_f64_sqrt.mojo \
 #     --target-accelerator sm_90 -o /tmp/repro_nvidia_f64_sqrt
 #
-# Expected compiler diagnostic:
-#   constraint failed: DType.float64 is not supported for approx sqrt on
-#   NVIDIA GPU
+# Expected output on current nightlies:
+#   sqrt(4.0) = 2.0
 
 from layout import TensorLayout, TileTensor, row_major
 from std.gpu.host import DeviceContext

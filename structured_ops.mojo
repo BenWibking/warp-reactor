@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# ABOUTME: Structured eight-warp DAG dispatch and shared-memory configuration.
+# ABOUTME: Hopper 32-cell DAG dispatch and shared-memory configuration.
 
 import reproducer
 from generated.slices_jac import (
@@ -23,16 +23,59 @@ from generated.slices_rhs import (
     rhs_specie_slice_6,
     rhs_specie_slice_7,
 )
+from generated.slices_jac_shared import (
+    ScratchSlots as JacScratchSlots,
+    jac_nuc_slice_0_shared,
+    jac_nuc_slice_1_shared,
+    jac_nuc_slice_2_shared,
+    jac_nuc_slice_3_shared,
+    jac_nuc_slice_4_shared,
+    jac_nuc_slice_5_shared,
+    jac_nuc_slice_6_shared,
+    jac_nuc_slice_7_shared,
+)
+from generated.slices_rhs_shared import (
+    ScratchSlots as RhsScratchSlots,
+    rhs_eint_slice_6_shared,
+    rhs_specie_slice_0_shared,
+    rhs_specie_slice_1_shared,
+    rhs_specie_slice_2_shared,
+    rhs_specie_slice_3_shared,
+    rhs_specie_slice_4_shared,
+    rhs_specie_slice_5_shared,
+    rhs_specie_slice_6_shared,
+    rhs_specie_slice_7_shared,
+)
 from layout import TensorLayout, TileTensor
 from std.gpu import WARP_SIZE, barrier, block_idx, thread_idx
+from std.gpu.memory import AddressSpace
 from std.math import min
 
 
-comptime NumWarps = 8
+comptime DagWarps = 8
+comptime DagWaves = 2
+comptime DagWarpsPerWave = DagWarps // DagWaves
+comptime OwnerWarps = 8
+comptime LuGroupsPerWarp = 4
+comptime LuGroupWidth = 8
 comptime TileCells = 32
-comptime BatchCells = NumWarps
-comptime BatchesPerTile = TileCells // BatchCells
-comptime MaxSharedBytes = 48 * 1024
+comptime BatchCells = TileCells
+comptime BatchesPerTile = 1
+comptime BlockThreads = OwnerWarps * WARP_SIZE
+comptime DynamicJBytes = TileCells * reproducer.Neqs * reproducer.Neqs * 8
+comptime DagScratchSlots = (
+    JacScratchSlots if JacScratchSlots >= RhsScratchSlots else RhsScratchSlots
+)
+comptime DagInputValues = TileCells * reproducer.Neqs
+comptime DagScratchValues = TileCells * DagScratchSlots
+comptime RhsValues = TileCells * reproducer.Neqs
+comptime DynamicJValues = TileCells * reproducer.Neqs * reproducer.Neqs
+comptime DagScratchOffset = DynamicJValues
+comptime RhsOffset = DagScratchOffset + DagScratchValues
+comptime DagInputOffset = RhsOffset + RhsValues
+comptime DynamicSharedValues = DagInputOffset + DagInputValues
+comptime DynamicSharedBytes = DynamicSharedValues * 8
+comptime HopperSharedBytes = 227 * 1024
 comptime MaxExchangeBytes = 8 * 1024
 comptime GeneratedExchangeBytes = 1024
 
@@ -42,31 +85,30 @@ def align_up(value: Int, alignment: Int) -> Int:
 
 
 struct SmemLayout:
-    comptime JOffset = 0
-    comptime JBytes = BatchCells * reproducer.Neqs * reproducer.Neqs * 8
-    comptime BaseOffset = align_up(Self.JOffset + Self.JBytes, 16)
+    comptime BaseOffset = 0
     comptime BaseBytes = TileCells * reproducer.Neqs * 8
     comptime CandidateOffset = align_up(Self.BaseOffset + Self.BaseBytes, 16)
     comptime CandidateBytes = TileCells * reproducer.Neqs * 8
     comptime VectorsOffset = align_up(
         Self.CandidateOffset + Self.CandidateBytes, 16
     )
-    comptime VectorsBytes = 5 * BatchCells * reproducer.Neqs * 8
+    comptime VectorsBytes = 4 * TileCells * reproducer.Neqs * 8
     comptime XtOffset = align_up(Self.VectorsOffset + Self.VectorsBytes, 16)
-    comptime XtBytes = BatchCells * 16 * 8
+    comptime XtBytes = 0
     comptime MetadataOffset = align_up(Self.XtOffset + Self.XtBytes, 16)
-    comptime MetadataBytes = 4096
+    comptime MetadataBytes = 2560
     comptime ExchangeOffset = align_up(
         Self.MetadataOffset + Self.MetadataBytes, 16
     )
-    comptime ExchangeBytes = GeneratedExchangeBytes
+    comptime ExchangeBytes = 0
     comptime ControllerOffset = align_up(
         Self.ExchangeOffset + Self.ExchangeBytes, 16
     )
-    comptime ControllerBytes = 1024
-    comptime Bytes = align_up(
+    comptime ControllerBytes = 256
+    comptime StaticBytes = align_up(
         Self.ControllerOffset + Self.ControllerBytes, 16
     )
+    comptime Bytes = DynamicSharedBytes + Self.StaticBytes
 
 
 struct FullBarrierSync:
@@ -91,13 +133,19 @@ struct FullBarrierSync:
 
 def validate_config():
     comptime assert TileCells == 32
-    comptime assert TileCells % BatchCells == 0
-    comptime assert BatchCells == NumWarps
-    comptime assert BatchCells <= WARP_SIZE
-    comptime assert reproducer.Neqs <= WARP_SIZE
-    comptime assert NumWarps * WARP_SIZE <= 1024
+    comptime assert WARP_SIZE == 32, "M4 is Hopper-only"
+    comptime assert BatchCells == TileCells
+    comptime assert BatchesPerTile == 1
+    comptime assert DagWarps == 8
+    comptime assert DagWaves * DagWarpsPerWave == DagWarps
+    comptime assert DagWarpsPerWave == 4
+    comptime assert OwnerWarps * LuGroupsPerWarp == TileCells
+    comptime assert LuGroupWidth * LuGroupsPerWarp == WARP_SIZE
+    comptime assert reproducer.Neqs <= 2 * LuGroupWidth
+    comptime assert BlockThreads == 256
+    comptime assert DagScratchSlots == JacScratchSlots
     comptime assert GeneratedExchangeBytes <= MaxExchangeBytes
-    comptime assert SmemLayout.Bytes <= MaxSharedBytes
+    comptime assert SmemLayout.Bytes <= HopperSharedBytes
 
 
 def dispatch_jac_slice(
@@ -151,6 +199,66 @@ def dispatch_rhs_slice(
         rhs_specie_slice_7(state, rhs, X, z)
 
 
+comptime SharedPointer = UnsafePointer[
+    Scalar[DType.float64],
+    MutUntrackedOrigin,
+    address_space=AddressSpace.SHARED,
+]
+
+
+def dispatch_jac_slice_shared(
+    warp_id: Int,
+    inputs: SharedPointer,
+    outputs: SharedPointer,
+    scratch: SharedPointer,
+    cell: Int,
+    z: Float64,
+):
+    if warp_id == 0:
+        jac_nuc_slice_0_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 1:
+        jac_nuc_slice_1_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 2:
+        jac_nuc_slice_2_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 3:
+        jac_nuc_slice_3_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 4:
+        jac_nuc_slice_4_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 5:
+        jac_nuc_slice_5_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 6:
+        jac_nuc_slice_6_shared(inputs, outputs, scratch, cell, z)
+    else:
+        jac_nuc_slice_7_shared(inputs, outputs, scratch, cell, z)
+
+
+def dispatch_rhs_slice_shared(
+    warp_id: Int,
+    inputs: SharedPointer,
+    outputs: SharedPointer,
+    scratch: SharedPointer,
+    cell: Int,
+    z: Float64,
+):
+    if warp_id == 0:
+        rhs_specie_slice_0_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 1:
+        rhs_specie_slice_1_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 2:
+        rhs_specie_slice_2_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 3:
+        rhs_specie_slice_3_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 4:
+        rhs_specie_slice_4_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 5:
+        rhs_specie_slice_5_shared(inputs, outputs, scratch, cell, z)
+    elif warp_id == 6:
+        rhs_specie_slice_6_shared(inputs, outputs, scratch, cell, z)
+        rhs_eint_slice_6_shared(inputs, outputs, scratch, cell, z)
+    else:
+        rhs_specie_slice_7_shared(inputs, outputs, scratch, cell, z)
+
+
 def dag_slice_kernel[
     StateLayout: TensorLayout,
     JacobianLayout: TensorLayout,
@@ -168,8 +276,8 @@ def dag_slice_kernel[
     var sync = FullBarrierSync()
     var warp_id = thread_idx.x // WARP_SIZE
     var lane = thread_idx.x % WARP_SIZE
-    var cell = block_idx.x * BatchCells + lane
-    var evaluating = warp_id < NumWarps and lane < BatchCells and cell < num_cells
+    var cell = block_idx.x * TileCells + lane
+    var evaluating = warp_id < DagWarps and cell < num_cells
     if evaluating:
         var y = reproducer.VecTensor.stack_allocation()
         for component in range(reproducer.Neqs):
@@ -197,7 +305,7 @@ def dag_slice_kernel[
         right_hand_sides[cell, first_component] = reproducer.vget(
             rhs, first_component
         )
-        var second_component = warp_id + NumWarps
+        var second_component = warp_id + DagWarps
         if second_component < reproducer.NumSpec:
             right_hand_sides[cell, second_component] = reproducer.vget(
                 rhs, second_component

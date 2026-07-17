@@ -6,7 +6,7 @@ from layout import Layout, LayoutTensor
 from std.math import abs, cbrt, exp, isfinite, log, max, min, sqrt
 from std.memory import bitcast
 from std.sys import argv, inlined_assembly
-from std.sys.info import is_gpu, is_nvidia_gpu
+from std.sys.info import is_nvidia_gpu
 from std.time import perf_counter_ns
 
 comptime NumSpec = 14
@@ -52,19 +52,7 @@ comptime MatTensor = LayoutTensor[DType.float64, MatLayout, MutAnyOrigin]
 
 
 def portable_sqrt(value: Float64) -> Float64:
-    comptime if is_nvidia_gpu():
-        return inlined_assembly[
-            "sqrt.rn.f64 $0, $1;",
-            Float64,
-            constraints="=d,d",
-            has_side_effect=False,
-        ](value)
-    elif is_gpu():
-        if value == 0.0:
-            return 0.0
-        return exp(0.5 * log(value))
-    else:
-        return sqrt(value)
+    return sqrt(value)
 
 
 def portable_mul(lhs: Float64, rhs: Float64) -> Float64:
