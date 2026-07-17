@@ -1,6 +1,6 @@
 # Design: Warp-Specialized Mojo GPU Chemistry Kernel
 
-Status: **approved direction; implementation and GPU feasibility gates pending**
+Status: **Hopper M4 spill-free implementation; grid-1 correctness established**
 Date: 2026-07-16
 Authors: Ben Wibking + design review sessions
 
@@ -47,16 +47,16 @@ machines:
 1. **Correctness**: T0--T8 pass; the GPU output passes the packed final-state
    comparator against the new grid-wide CPU policy reference; partial tiles,
    stopped cells, singular retries, and no-active-cell termination are covered.
-2. **Resources**: both sm_90 and gfx90a builds report static shared memory,
-   registers, spills, and private/local bytes. The v1 shared layout is at most
-   48 KiB per CTA. Zero spills is the target; any exception must be explicit,
-   measured, and still satisfy the performance gate.
-3. **Performance**: on every backend where M4 is proposed as the default, its
-   grid-64 wall time is lower than M1 under the same driver policy, inputs, and
-   measurement protocol. Otherwise M1 remains the default on that backend.
-4. **Portability**: configuration assertions pass for both 32-lane NVIDIA
-   warps and 64-lane AMD CDNA wavefronts, and the GPU test suite has no
-   out-of-bounds or barrier-divergence failures.
+2. **Resources**: the sm_90 build reports static and dynamic shared memory,
+   registers, spills, stack/local bytes, and launch occupancy. The v1 layout
+   uses Hopper's large-shared-memory opt-in and stays below the 227 KiB
+   per-block limit. Spills are measured explicitly and must be zero.
+3. **Performance**: on Hopper, M4 grid-64 wall time is lower than M1 under the
+   same driver policy, inputs, and measurement protocol. Otherwise M1 remains
+   the default.
+4. **Execution safety**: full and partial 32-cell tiles have no out-of-bounds
+   or barrier-divergence failures. M4 is intentionally sm_90-only; gfx90a and
+   other 64-lane targets are not acceptance targets.
 
 ## 2. Background
 
@@ -128,11 +128,9 @@ configuration as the autotuning surface, type-enforced component boundaries.
   support; a minimal Float64 kernel fails with
   `LLVM ERROR: Failed to verify LLVM IR for Metal`. All GPU compile+test
   steps must run on the Linux+GPU machine. CPU unit tests run anywhere.
-- GPU targets: NVIDIA sm_90 and AMD gfx90a (per README). `WARP_SIZE` is
-  comptime in Mojo: 32 on NVIDIA, 64 on AMD CDNA. V1 fixes the *logical* tile
-  at 32 cells on both backends and uses `WARP_SIZE` only for physical launch
-  geometry and warp primitives. This keeps ownership and storage identical;
-  v1 intentionally leaves extra AMD lanes idle (see §10 risks).
+- GPU target: NVIDIA Hopper sm_90 with 32-lane warps. M4 deliberately uses
+  Hopper's large shared-memory allocation and is not constrained by gfx90a
+  LDS. `validate_config()` rejects `WARP_SIZE != 32`.
 - Mojo GPU essentials (from the mojo-gpu-fundamentals skill):
   kernels are plain `def` (no decorator), launched with
   `ctx.enqueue_function[kernel](args, grid_dim=..., block_dim=...)`;
@@ -154,13 +152,12 @@ configuration as the autotuning surface, type-enforced component boundaries.
 
 ### 4.1 Execution model
 
-- **V1 configuration**: `NUM_WARPS = 8`, `TILE_CELLS = 32`,
-  `BATCH_CELLS = NUM_WARPS = 8`, and `BATCHES_PER_TILE = 4` on both
-  backends. Launch with `grid_dim = ceil(num_cells / TILE_CELLS)` and
-  `block_dim = NUM_WARPS * WARP_SIZE` (256 threads on NVIDIA, 512 on AMD).
-  Compile-time checks require `TILE_CELLS % BATCH_CELLS == 0`,
-  `BATCH_CELLS == NUM_WARPS`, `Neqs <= WARP_SIZE`, and a device-valid block
-  size.
+- **V1 configuration**: `DAG_WARPS = OWNER_WARPS = 8`, `TILE_CELLS = 32`,
+  `BATCH_CELLS = 32`, `BATCHES_PER_TILE = 1`, `LU_GROUP_WIDTH = 8`, and
+  `LU_GROUPS_PER_WARP = 4`. Launch with
+  `grid_dim = ceil(num_cells / TILE_CELLS)` and `block_dim = 256`. Compile-time
+  checks require `WARP_SIZE == 32`, four LU groups per warp, 32 logical owner
+  groups, and a total shared-memory budget below Hopper's 227 KiB limit.
 - **Device state layout**: use field-major structure-of-arrays storage, not a
   raw `CollapseState` or one untyped tensor. The logical `DeviceCells` bundle
   contains `Float64` state fields (`rho`, `T`, `e`, `xn[14]`, `time`,
@@ -170,14 +167,12 @@ configuration as the autotuning surface, type-enforced component boundaries.
   packed 172-byte C++ record is a host serialization format, not a device
   layout. M1 determines whether Mojo can pass the logical bundle directly or
   whether kernels take its tensors as separate arguments.
-- **Batch mapping**: a complete ROS2S trial is evaluated in four batches. In
-  batch *b*, DAG-slice lane *l* handles tile cell
-  `b * BATCH_CELLS + l` for `l < BATCH_CELLS`; other lanes contribute neutral
-  values but follow the same control flow. Owner warp *w* factors and solves
-  exactly cell `b * BATCH_CELLS + w`. This batching is deliberate: it bounds
-  J staging and lets a warp retain only one cell's factors through k1--k3.
-  It is a storage/execution schedule only: every batch evaluates the same
-  shared `(x, h)`, and no batch advances or commits before the tile decision.
+- **Single-batch mapping**: every generated DAG slice runs across lanes 0--31,
+  so one warp evaluates that slice for all 32 tile cells. During LU/solves,
+  physical warp *w* is divided into four independent 8-lane groups. Group *g*
+  owns cell `4*w + g`; local lane *l* owns columns/components `l` and `l+8`
+  when they exist. All 32 systems factor and solve concurrently. The full
+  32x15x15 Jacobian/LU arena remains in Hopper shared memory through k1--k3.
 - **Grid-wide physical timestep (decided 2026-07-16)**: every participating
   cell in the grid advances through the same outer interval `dt_grid` during a
   global collapse step.
@@ -266,11 +261,11 @@ configuration as the autotuning surface, type-enforced component boundaries.
   reduction inside each adaptive substep and is explicitly out of scope.
 - All threads execute the same phase/barrier sequence. Validity and
   participation masks guard arithmetic and memory accesses, never barriers.
-- **Cell ownership**: across the tile, warp *w* owns cells
-  `{w, w+8, w+16, w+24}`. It processes only one of them in each complete
-  batch trial, including LU, three solves, state derivation, candidate/error
-  production, and collapse bookkeeping. Candidate state is staged until the
-  CTA-level decision; rejected or singular trials never overwrite base `y`.
+- **Cell ownership**: physical warp *w* owns cells `{4*w, ..., 4*w+3}` through
+  four logical 8-lane groups. Every group remains active throughout LU, three
+  solves, state derivation, and candidate/error production. Candidate state is
+  staged until the CTA-level decision; rejected or singular trials never
+  overwrite base `y`.
 
 ### 4.2 Driver and phase schedule (one global collapse step)
 
@@ -307,35 +302,30 @@ Inside the chemistry kernel:
    `x = 0`, set `tout = h = dt_grid`, and reset controller history
    (`hacc`/`erracc`). The perturbation is not repeated here.
 2. **Substep loop** (until the CTA controller reaches `dt_grid` or fails):
-   reset the shared singular flag and candidate-error slots, then execute the
-   following complete trial for batches `b = 0..3`. The batch loop and all
-   early-exit decisions are CTA-uniform.
-   - **P0 base state** (owner warp *w* handles cell `8*b+w`): derive floored
-     X[14] and T from the immutable base `y`, and write the batch X/T buffer.
-   - **P1 Jacobian + LU** (all warps then owners): lanes 0..7 evaluate their
-     warp's generated J slice for the eight batch cells and fill the
-     8×225 J stage. Owner warp *w* loads column-owned
-     `E = (1/(h*gamma))I - J` for its one cell and factors it in registers.
-     A CTA reduction publishes `batch_singular`. If set, every thread skips
-     the remaining work/batches, the controller halves `h`, discards all
-     candidates, and retries the whole tile. `nsing` is CTA-level and persists
-     across the outer integration, matching the scalar code: the fifth
-     singular factorization fails before another halving.
-   - **P2 k1**: the generated RHS slices fill the 8×15 ydot stage; each owner
-     solves with its retained LU factors and forms the first stage state and
-     `k2` seed in batch scratch.
-   - **P3 k2**: owners derive batch X/T from the first stage state; generated
-     RHS slices evaluate it; owners solve and form the second stage state plus
-     `work`.
-   - **P4 k3 + candidate**: repeat X/T and RHS evaluation; owners solve k3,
-     form the candidate and embedded error, write the candidate to the
-     full-tile candidate buffer, and write one scalar error per cell. LU
-     factors are now dead and may be released before the next batch.
-3. **CTA decision**: after all four batches complete, reduce
+   reset the shared singular flag and candidate-error slots, then execute one
+   complete 32-cell trial. All early-exit decisions are CTA-uniform.
+   - **P0 base state**: DAG lanes derive floored X[14] and T from immutable
+     base `y` for all 32 cells.
+   - **P1 Jacobian + LU**: each of eight warps evaluates one generated J slice
+     across lanes 0--31 and fills the 32x225 dynamic shared arena. The same
+     arena is transformed in place to `E = (1/(h*gamma))I - J`. Four 8-lane
+     groups per warp factor 32 systems concurrently, each lane owning up to
+     two shared columns. A CTA reduction publishes `tile_singular`; on a
+     singular trial the controller halves `h`, discards every candidate, and
+     retries the whole tile. The fifth singular factorization fails.
+   - **P2 k1**: generated RHS slices fill the 32x15 ydot stage; the 32 groups
+     solve with the retained shared LU factors and form the first stage state
+     and `k2` seed.
+   - **P3 k2**: generated RHS slices evaluate the first stage; groups solve and
+     form the second stage state plus `work`.
+   - **P4 k3 + candidate**: generated RHS slices evaluate the second stage;
+     groups solve k3, form each candidate and embedded error, and write one
+     scalar error per participating cell. The shared LU arena is then dead.
+3. **CTA decision**: after the 32-cell trial completes, reduce
    `err_tile = max(err_cell)` over participating cells. Apply the unchanged
    ROS2S/Gustafsson formulas once to that scalar. A non-finite participating
    error is a tile failure. On rejection, retain base `y`, update the common
-   `h`, and rerun all batches. On acceptance, owner warps copy every
+   `h`, and rerun the tile trial. On acceptance, owner groups copy every
    participating candidate to base `y`, advance the shared `x`, and truncate
    the next `h` to the remaining common horizon.
 4. **Epilogue** (owner warps): on successful completion, floor+normalize,
@@ -358,7 +348,7 @@ Notes:
   instruction-cache divergence across k-stages.
 - Base `y` is immutable for the entire tile trial. Candidate and stage buffers
   are separate, so CTA-wide rejection and singular retry are transactional.
-- X/T and other batch scratch are sequenced by `barrier()`; v1 uses
+- X/T and other trial scratch are sequenced by `barrier()`; v1 uses
   `barrier()` between all producer/consumer phases (FullBarrierSync).
 - Any chemistry failure is terminal for the global run. Other CTAs may already
   have committed when the host observes the failure; v1 does not promise a
@@ -375,8 +365,8 @@ and outputs span multiple lines. The generator (§6) parses complete statements,
 builds an explicit dependency graph, and verifies that source order is
 topological; it does not infer convexity from line ranges.
 
-For each 8-cell batch, every warp evaluates one generated slice across lanes
-0..7. The generator assigns outputs to warps (J: balanced row groups; combined
+For each 32-cell trial, every warp evaluates one generated slice across lanes
+0..31. The generator assigns outputs to warps (J: balanced row groups; combined
 RHS: balanced outputs), pulls in each output's transitive dependencies, and
 applies Singe's recompute-vs-exchange rule:
 
@@ -399,71 +389,65 @@ generator must be able to split long slices into bounded regions with
 CTA-uniform reconvergence points. If eight paths show instruction-fetch
 regression, the fallback order is: rebalance/recompute to shorten regions,
 split J into more reconvergent regions, then use a smaller feasible
-`NUM_WARPS`. Eight long paths are not assumed safe without measurement.
+`DAG_WARPS`. Eight long paths are not assumed safe without measurement.
 
-### 4.4 Warp-cooperative LU and solves (owner warps)
+### 4.4 Shared LU and solves (8-lane owner groups)
 
 Per owned cell, 15×15 LU with partial pivoting (LINPACK-style, matching
 `lu_decomposition`/`lu_solve` in `reproducer.cpp:96-181`):
 
-- During one batch, lane *c* in [0,15) owns matrix column *c* for exactly one
-  cell and holds its 15 row values. Lanes 15..`WARP_SIZE-1` are neutral in v1.
-- At elimination step *k*, lane *k* performs the ordered local scan of
-  `abs(E[i,k])`, `i >= k`, using first-strict-max tie-breaking, then broadcasts
-  the pivot row. For each active trailing column `c >= k`, lane *c* swaps its
-  own row-*k* and row-*pivot* values. No row-owned shuffle exchange is needed.
-- Lane *k* forms the signed LINPACK multipliers in column *k*. For each
-  trailing row, it broadcasts that multiplier; lanes `c > k` apply the Schur
-  update to their local column value. The algorithm therefore has one
-  consistent column-ownership model for pivoting, swapping, and elimination.
-- Each lane retains its column (15 `Float64` values) and its distributed pivot
-  metadata through all three solves. The solve vector is distributed one
-  component per active lane. At step *k*, lane *k* broadcasts the pivot index;
-  `x[pivot]` is gathered from lane *pivot* for the swap. Lane *k* then
-  broadcasts the needed `LU[j,k]` value for each affected component *j*, and
-  lane *j* applies its forward/back-substitution update. The same factors serve
-  k1, k2, and k3, then die before the next batch.
-- `InlineArray` is a storage expression, not proof of register allocation.
-  Compiler resource reports and spill counts are the acceptance evidence.
-- Forward/back substitution (`lu_solve`): lane-cooperative with broadcasts;
-  used 3× per substep (k₁, k₂, k₃), reusing the same factors.
+- Each physical warp contains four independent 8-lane groups. In each group,
+  local lane *l* owns shared columns/components `l` and `l+8` when present.
+- At elimination step *k*, lane `k % 8` performs the ordered scan of
+  `abs(E[i,k])`, `i >= k`, preserving first-strict-max tie-breaking. All lanes
+  swap their owned shared columns, the pivot owner writes signed LINPACK
+  multipliers, and owners of columns `c > k` apply the Schur updates in place.
+- The 32 factorizations remain in the dynamic shared Jacobian arena through all
+  three solves. RHS vectors are shared and distributed two components per lane;
+  forward/back substitution reads the retained LU entries directly.
+- CTA barriers synchronize the four groups in every warp and all eight warps.
+  Participation masks guard memory operations only, so partial tiles follow the
+  identical barrier sequence.
 
 ### 4.5 Data placement budget
 
-V1 uses a project cap of 48 KiB static shared memory per CTA, leaving a single
-portable budget rather than depending on a backend-specific large-shared-memory
-opt-in. The conservative layout budget is:
+V1 uses Hopper's large-shared-memory opt-in. The Jacobian/LU arena and the
+generated-DAG scratch are dynamic shared memory because CUDA limits
+non-opt-in static shared allocations to 48 KiB. The implemented layout is:
 
 | Buffer | Formula | Bytes |
 |---|---:|---:|
-| J staging | `8 * 225 * 8` | 14,400 |
+| Dynamic J/LU arena | `32 * 225 * 8` | 57,600 |
+| Dynamic generated-DAG scratch | `32 * 534 * 8` | 136,704 |
+| Dynamic RHS vectors | `32 * 15 * 8` | 3,840 |
+| Dynamic X/T inputs | `32 * 15 * 8` | 3,840 |
+| **Dynamic launch allocation** |  | **201,984** |
 | Base `y` for the tile | `32 * 15 * 8` | 3,840 |
 | Uncommitted candidate `y` | `32 * 15 * 8` | 3,840 |
-| Batch vectors (stage-y, ydot, k1, k2, work/error) | `5 * 8 * 15 * 8` | 4,800 |
-| Batch X/T inputs | at most `8 * 16 * 8` | 1,024 |
-| Collapse metadata, stats, masks | budget | 4,096 |
-| Generated DAG exchange arena | hard budget | 8,192 |
-| Controller, reductions, sync flags | budget | 1,024 |
-| **Subtotal before padding/alignment** |  | **41,216 (40.25 KiB)** |
+| Trial vectors (stage-y, k1, k2, work) | `4 * 32 * 15 * 8` | 15,360 |
+| LU pivots | `32 * 15 * 4` | 1,920 |
+| Info, participation, error, controller | measured | 544 |
+| **Static allocation (`ptxas`)** |  | **25,504** |
+| **Total per CTA** |  | **227,488 (222.2 KiB)** |
 
 `SmemLayout` is the source of truth: it computes aligned offsets and exposes a
-comptime total. Kernel configuration validation rejects totals above 48 KiB.
-The slicer emits its exact exchange-arena requirement; if it exceeds 8 KiB,
-the generator must recompute more expressions, rebalance slices, or reject the
-configuration. The table counts base state only once and includes all trial
-vectors; there is no hidden full-tile `BurnState` allocation.
+comptime total. Kernel configuration validation rejects totals above 227 KiB.
+The slicer emits 534 reusable `Float64` scratch slots per cell. The eight DAG
+slices execute sequentially through that arena, with one physical warp
+evaluating all 32 cells for each slice. This deliberately exchanges slice
+parallelism for bounded live ranges and zero compiler spills. The table counts
+base state only once and includes all trial vectors; there is no hidden
+full-tile `BurnState` allocation. The measured layout leaves 4,960 bytes below
+Hopper's 232,448-byte per-block shared-memory limit.
 
 Private/register placement is measured rather than estimated as a hard
 occupancy promise:
 
-- During LU, each active lane has 15 `Float64` factor values for one cell
-  (roughly 30 32-bit vector-register allocation units before metadata and
-  compiler temporaries), not four cells' factors.
-- Batch state vectors and all accept/reject candidates live in shared memory.
-  DAG slice temporaries and the current LU column are intended to remain
-  private and short-lived.
+- LU factors, trial state vectors, all accept/reject candidates, and generated
+  DAG temporaries live in shared memory. Boolean DAG temporaries are encoded
+  as `0.0`/`1.0` in the numeric scratch arena.
 - Physical register accounting, occupancy, spills, and private/local bytes come
-  from the sm_90/gfx90a compiler reports. M3 records the LU-only report; M4
+  from the sm_90 compiler report. M3 records the LU-only report; M4
   records the full-kernel report. No source-level `InlineArray` assumption or
   guessed register cap substitutes for those reports.
 
@@ -504,11 +488,14 @@ mojo-syntax skill: `def` only, `comptime`, `Self.`-qualified params,
 ```mojo
 # ChemConfig — the comptime autotuning surface (Singe §4)
 struct ChemConfig:
-    comptime NUM_WARPS = 8
-    comptime TILE_CELLS = 32                 # logical cells on both backends
-    comptime BATCH_CELLS = Self.NUM_WARPS    # one current cell per owner warp
-    comptime BATCHES_PER_TILE = Self.TILE_CELLS // Self.BATCH_CELLS
-    comptime MAX_SHARED_BYTES = 48 * 1024
+    comptime DAG_WARPS = 8
+    comptime OWNER_WARPS = 8
+    comptime TILE_CELLS = 32
+    comptime BATCH_CELLS = 32
+    comptime BATCHES_PER_TILE = 1
+    comptime LU_GROUP_WIDTH = 8
+    comptime LU_GROUPS_PER_WARP = 4
+    comptime MAX_SHARED_BYTES = 100 * 1024
     comptime MAX_EXCHANGE_BYTES = 8 * 1024
     comptime Sync = FullBarrierSync           # v2: CounterSync
     comptime J_SLICE = jac_slice_tables       # from tools/slice_dag.py
@@ -516,11 +503,12 @@ struct ChemConfig:
 
 def validate_config[cfg: ChemConfig]():
     comptime assert cfg.TILE_CELLS == 32
-    comptime assert cfg.TILE_CELLS % cfg.BATCH_CELLS == 0
-    comptime assert cfg.BATCH_CELLS == cfg.NUM_WARPS
-    comptime assert cfg.BATCH_CELLS <= WARP_SIZE
-    comptime assert Neqs <= WARP_SIZE
-    comptime assert cfg.NUM_WARPS * WARP_SIZE <= 1024
+    comptime assert WARP_SIZE == 32
+    comptime assert cfg.BATCH_CELLS == cfg.TILE_CELLS
+    comptime assert cfg.BATCHES_PER_TILE == 1
+    comptime assert cfg.OWNER_WARPS * cfg.LU_GROUPS_PER_WARP == cfg.TILE_CELLS
+    comptime assert cfg.LU_GROUP_WIDTH * cfg.LU_GROUPS_PER_WARP == WARP_SIZE
+    comptime assert Neqs <= 2 * cfg.LU_GROUP_WIDTH
     comptime assert SmemLayout[cfg].BYTES <= cfg.MAX_SHARED_BYTES
 ```
 
@@ -537,9 +525,9 @@ struct CellStateIO[cfg: ChemConfig](TrivialRegisterPassable):
 ```
 
 ```mojo
-# DagSliceOp (TileOp) — evaluate this warp's slice over one 8-cell batch
+# DagSliceOp (TileOp) — evaluate this warp's slice over all 32 cells
 struct DagSliceOp[cfg: ChemConfig, table: SliceTable](TrivialRegisterPassable):
-    def eval_batch(
+    def eval_tile(
         self,
         xt: SharedXT,            # batch X[14], T from shared
         mut out: SharedStage,    # J or ydot staging
@@ -548,12 +536,10 @@ struct DagSliceOp[cfg: ChemConfig, table: SliceTable](TrivialRegisterPassable):
 ```
 
 ```mojo
-# WarpLuOp (TileOp) — owner-warp LU + solves for owned cells
-struct WarpLuOp[cfg: ChemConfig](TrivialRegisterPassable):
-    var column: InlineArray[Float64, Neqs]  # one column of one current cell
-    var pivot_row: Int                     # distributed: meaningful in lane k
-    def factorize(mut self, fac: Float64, j_stage: SharedStage) -> Int: ...
-    def solve(self, mut x: SharedVec): ...
+# SharedLuOp (TileOp) — four 8-lane systems per physical warp
+struct SharedLuOp[cfg: ChemConfig](TrivialRegisterPassable):
+    def factorize(self, mut j_lu: SharedJacobian, cell: Int, lane: Int) -> Int: ...
+    def solve(self, j_lu: SharedJacobian, mut x: SharedVec, cell: Int, lane: Int): ...
 ```
 
 ```mojo
@@ -597,8 +583,7 @@ def chem_collapse_kernel[cfg: ChemConfig](
     while controller_running(smem):  # one CTA-uniform shared predicate
         begin_trial[cfg](smem, warp_id, lane)
         sync.phase_barrier()
-        comptime for batch in range(cfg.BATCHES_PER_TILE):
-            run_complete_batch[cfg, batch](smem, warp_id, lane)
+        run_complete_tile_trial[cfg](smem, warp_id, lane)
         finish_trial[cfg](smem, warp_id, lane)  # singular retry or max-error decision
         sync.phase_barrier()
     epilogue[cfg](
@@ -610,7 +595,7 @@ def chem_collapse_kernel[cfg: ChemConfig](
 
 Every function that indexes a `TileTensor` must include the appropriate
 `comptime assert tensor.flat_rank == N`; the ellipses above intentionally omit
-concrete layouts and origins until M1 establishes them on both GPU backends.
+concrete layouts and origins until M1 establishes them on the target GPU.
 
 ## 6. `tools/slice_dag.py` (generator tool)
 
@@ -756,27 +741,27 @@ bring-up vehicle.**
 
 **M2 — robust DAG slicer + dispatch feasibility.** Implement
 `tools/slice_dag.py`, generated slices/reports, parser fixtures, and T2. Run the
-2/4/6/8-path instruction-footprint microbenchmark on both GPU backends before
+2/4/6/8-path instruction-footprint microbenchmark on Hopper before
 choosing the final dispatch-region layout. Reject generated configurations
 whose exchange arena exceeds 8 KiB.
 
-**M3 — column-owned LU + batched trial microkernel.** Implement `WarpLuOp`,
-T3, and the four-batch transactional trial path used by T6. Record LU-only and
-trial-microkernel resources on sm_90/gfx90a; do not proceed with a configuration
-that exceeds 48 KiB shared memory, fails partial-tile barriers, or spills the LU
-column by itself.
+**M3 — column-owned LU + transactional trial microkernel.** Implement
+`WarpLuOp`, T3, and the initial transactional trial path used by T6. M3's
+portable four-batch schedule is superseded in M4 by the Hopper shared-LU
+schedule after resource measurement showed that a 512-thread retained-column
+kernel cannot launch with the generated DAG's register allocation.
 
 **M4 — structured warp-specialized kernel.** Assemble components per §4–5
-with `FullBarrierSync`. Tests: T4, T6, T7, T8, then T5. Capture both backend
-resource reports and compare wall time/work counters against M1 before changing
-any default.
+with `FullBarrierSync`, one 32-cell batch, dynamic shared J/LU, and four 8-lane
+LU groups per warp. Tests: T4, T6, T7, T8, then T5. Capture the sm_90 resource
+report and compare wall time/work counters against M1 before changing a default.
 
 **M5 — tune.** Sweep only configurations that preserve `TILE_CELLS = 32` and
-pass the layout assertions: feasible `NUM_WARPS`/`BATCH_CELLS`, τ (recompute
+pass the layout assertions: feasible group widths, τ (recompute
 vs exchange), dispatch-region size, and CTAs per compute unit. Then optionally
 evaluate `CounterSync` overlap, constant striping across lanes (Singe §5.2),
-warp indexing (Singe §5.3), and logical subwarp/multi-cell LU strategies for
-AMD wave64. Re-run correctness because controller grouping or reduction order
+warp indexing (Singe §5.3), and alternative shared-LU mappings. Re-run
+correctness because controller grouping or reduction order
 must not change silently; update the README table.
 
 ## 9. Numerics policy details
@@ -807,7 +792,7 @@ Must NOT change:
   `density_driver += dt*density_driver/tff` rule (with `dt = dt_grid`), and
   the floor/normalize/balance-charge/eos sequence at step end.
 - Stable outer-minimum tie-breaking by lowest global cell ID; fixed 32-cell CTA
-  grouping in v1; transactional all-batch retry/commit; exact assignment of
+  grouping in v1; transactional whole-tile retry/commit; exact assignment of
   integrated-cell time from host-computed `next_grid_time`.
 - The final-state file format and comparison tolerances. The explicitly named
   grid-wide reference contents replace, rather than masquerade as, the legacy
@@ -818,17 +803,17 @@ Must NOT change:
 | Risk | Impact | Mitigation |
 |---|---|---|
 | Instruction-cache thrash from 8 structurally different J slices (Singe §5.1) | severe slowdown | M2 measures 2/4/6/8-path dispatch and generated code size; use bounded reconvergent regions, rebalance/recompute, or a smaller feasible warp count before M4 |
-| Barrier overhead on small 15×15 LU (Singe diffusion lost ~15%) | moderate | v1 accepts it; v2 CounterSync + batching overlap |
-| Low lane utilization in 8-cell DAG batches and 15-lane LU, especially on AMD wave64 | moderate/severe | accept for correctness-first v1, measure phase timings, then evaluate larger feasible batches or logical-subwarp/multi-cell LU without changing the 32-cell controller group |
-| Register/private-memory overshoot despite batching | low occupancy or spills | retain only one LU column/cell at a time, bound generated regions, tune recompute/exchange, and gate M3/M4 on compiler resource reports rather than source estimates |
-| Shared layout exceeds the portable cap after padding or generated exchanges | build failure or backend-specific opt-in | `SmemLayout.BYTES` comptime assertion, 8 KiB exchange cap, and generator rejection before full compilation |
+| Barrier overhead on small 15×15 shared LU | moderate | v1 accepts it; measure phase timings before introducing named-barrier overlap |
+| Eight-lane groups own two columns/components per lane | moderate shared-memory traffic | all 32 cells remain concurrent; profile before considering a different group width |
+| Generated DAG reaches 255 registers/thread | low occupancy | generated scalars use the explicit 534-slot shared arena; gate M4 on zero `ptxas` spill stores/loads and measured wall time |
+| Shared layout exceeds Hopper opt-in after padding or generated scratch | launch/build failure | `SmemLayout.Bytes` comptime assertion, 227 KiB Hopper cap, exact `shared_mem_bytes`, and generator rejection before full compilation |
 | Mojo stdlib missing named barriers | none for v1 | FullBarrierSync only needs `barrier()`; verify mbarrier API in M0 for v2 |
 | Slicer mis-parses multiline/generated scopes | wrong results | balanced statement parser, pinned manifest/hash, negative fixtures, and bitwise T2 on every regeneration |
 | Grid-wide minimum is dominated by one outlier cell | more outer collapse steps for the whole grid | this is the intended test-problem policy; report min/median/max over finite copied CTA minima and the limiting cell ID each global step |
 | Preparation kernel + host pair reduction | extra launch, ~96 KiB transfer at grid-64, and synchronization per global step | prioritize an auditable v1 result; measure the isolated overhead in M1 and preserve stable `(dt, cell)` semantics in any later device reduction |
 | Perturbation applied in both preparation and chemistry kernels | incorrect density/state update | preparation owns perturbation exclusively; T7 compares the prepared states and deterministic perturbation factors against the CPU reference |
 | Unified-controller cost: a CTA advances at the pace of its worst cell's error estimate every substep (reject-if-any) | more substeps than per-cell adaptivity | record per-CTA accepted/rejected counts and compare M1 vs M4; tune tile composition only after correctness is established |
-| A singularity discovered after earlier batches produced candidates | partial state update on retry | base `y` is immutable until the one CTA decision; T6 poisons candidate buffers and proves whole-tile discard/retry |
+| A singularity occurs after candidate scratch was written | partial state update on retry | base `y` is immutable until the one CTA decision; T6 poisons candidate buffers and proves whole-tile discard/retry |
 | One CTA fails after another CTA commits | globally partial failed state | failure is terminal in v1; host does not advance `grid_time` or compare/write final output, and no restart semantics are claimed |
 | Legacy/stale final-state file is mistaken for the new-policy oracle | false failure or accidental baseline replacement | explicit `*_cpu_gridwide.bin` name, checked sidecar manifest, schema-only reuse, and no silent overwrite |
 
@@ -857,10 +842,46 @@ pixi run mojo run tests/test_slice_dag.mojo
 
 # GPU machine: baseline + structured kernel (after M1/M4)
 pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
+pixi run mojo build -I . reproducer_structured_gpu.mojo \
+  -o reproducer_structured_gpu
 ./reproducer_gpu --grid 1 --no-compare-final-state
-./reproducer_gpu --grid 64 \
+./reproducer_structured_gpu --grid 64 \
   --compare-final-state final_states_grid64_cpu_gridwide.bin
 ```
+
+### 11.1 Current Hopper evidence (2026-07-16)
+
+- Environment: CUDA 12.9.1, driver 580.159.04, NVIDIA H200, compute
+  capability 9.0, Mojo `1.0.0b3.dev2026071614` (`1084b3d8`).
+- Grid 1: 438 global steps and final-state comparison PASS. The spill-free
+  structured measured region is 8.707 s; this one-cell case masks 31 owner
+  groups and is not a throughput result. Before explicit DAG scratch, the
+  structured result was 4.917 s versus data-parallel 2.882 s.
+- Grid 3 (27 cells, one partial CTA): structured 11.214 s versus data-parallel
+  15.426 s, with 1,000 global steps in both runs.
+- Before the CUDA driver was changed, the requested grid-32 comparison against
+  legacy `reproducer.cpp` measured structured 29.926 s (1,000 grid-wide outer
+  steps) versus CUDA 24.082 s (459 independent outer steps). That result was
+  not equal work.
+- After changing CUDA to use the same grid-wide outer timestep while retaining
+  an independent ROS2S controller in each thread, grid 32 takes 14.781 s
+  (14.93 s process time) for 1,000 outer steps. The structured kernel takes
+  29.926 s (31.71 s process time) for the same 1,000 outer steps, a raw
+  structured/CUDA ratio of 2.025. Controller behavior remains intentionally
+  different: CUDA accepts/rejects and retries per cell, while structured uses
+  one maximum-error CTA controller.
+- Under the identical protocol at grid 64, modified CUDA takes 32.174 s
+  (32.50 s process time) and structured takes 110.982 s (113.15 s process
+  time), both for 1,000 common outer steps. The raw structured/CUDA integration
+  time ratio is 3.449. This is one requested comparison run, not the
+  median-of-three measurement required by the formal performance gate.
+- Full adaptive sm_90 chemistry entry: 255 registers/thread, 25,504 bytes
+  static shared, 201,984 bytes dynamic shared, a 360-byte intentional local
+  frame, **0-byte spill stores, and 0-byte spill loads**. Every emitted
+  Jacobian/RHS helper also reports a zero-byte stack frame and zero spills.
+  The preparation entry uses 90 registers, 256 bytes static shared, a
+  472-byte intentional local frame, and zero spills. These `ptxas` figures are
+  static code-generation properties, not dynamic transaction counts.
 
 ## 12. Key file/line pointers
 
@@ -886,6 +907,6 @@ pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
 | 2026-07-16 | Grid-wide outer physical timestep `dt_grid = min_active(tff_reduc*tff)`; all integrated cells use it for density evolution, chemistry, and physical time | Ben |
 | 2026-07-16 | Unified CTA-level ROS2S controller (single physical `h`, accept-if-all-accept); no per-cell horizons or controller state; only validity/stopped-cell masks remain | Ben |
 | 2026-07-16 | Grid-wide synchronization ends at the outer `dt_grid` horizon; adaptive ROS2S substeps remain CTA-local | Ben |
-| 2026-07-16 | V1 uses a fixed 32-cell logical tile on NVIDIA and AMD; an 8-cell complete-trial batch retains one cell's LU factors per owner warp | design review |
+| 2026-07-16 | M4 gives up gfx90a portability and targets Hopper large shared memory: one 32-cell batch, eight physical warps, four 8-lane LU groups per warp, and shared in-place factors | Ben |
 | 2026-07-16 | Reuse the packed comparison schema/tolerances, but generate an explicitly named CPU reference for the new grid-wide/CTA-controller policy | design review |
 | 2026-07-16 | Reduce stable `(dt_candidate, cell_id)` pairs and assign one host-computed `next_grid_time` to every integrated cell | design review |

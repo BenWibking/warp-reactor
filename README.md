@@ -72,6 +72,14 @@ Run the CUDA reproducer:
 ./reproducer_cuda
 ```
 
+The CUDA/HIP driver uses a grid-wide outer physical timestep. A preparation
+kernel applies the scheduled perturbation and publishes each eligible cell's
+free-fall timestep; the host selects the global minimum, and the advance
+kernel integrates every participating cell over that same interval. Each GPU
+thread still owns an independent ROS2S controller, including its own error
+estimate, accepted/rejected substeps, and retry history. Output identifies
+this policy as `gridwide-independent`.
+
 Run the HIP reproducer:
 
 ```bash
@@ -86,9 +94,12 @@ Show the available options:
 ./reproducer --help
 ```
 
-By default, the run uses a `64^3` cell grid, enables deterministic density
-perturbations, and compares the final state against
-`final_states_grid64_cpu.bin`. To run without any reference comparison:
+By default, every backend uses a `64^3` cell grid and enables deterministic
+density perturbations. The CPU run compares against
+`final_states_grid64_cpu.bin`. CUDA/HIP do not select a reference by default
+because their `gridwide-independent` policy is not compatible with the legacy
+local-timestep CPU reference. Use `--compare-final-state FILE` with a reference
+generated for the same policy. To explicitly run without comparison:
 
 ```bash
 ./reproducer --no-compare-final-state
