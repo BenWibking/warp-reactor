@@ -100,6 +100,7 @@ class SliceDagGenerationTests(unittest.TestCase):
                     (Path(second) / name).read_bytes(),
                 )
             self.assertLessEqual(report_a["exchange_bytes"], 8192)
+            self.assertEqual(report_a["exchange_bytes"], 13 * 32 * 8)
             self.assertEqual(
                 report_a["input_sha256"],
                 hashlib.sha256((ROOT / "reproducer.mojo").read_bytes()).hexdigest(),
@@ -107,10 +108,27 @@ class SliceDagGenerationTests(unittest.TestCase):
             parsed = json.loads((Path(first) / "slice_report.json").read_text())
             self.assertEqual(parsed["functions"]["jac_nuc"]["outputs"], 225)
             self.assertEqual(
-                parsed["shared_scratch"]["jacobian"]["scratch_slots"], 457
+                parsed["shared_scratch"]["jacobian"]["scratch_slots"], 515
             )
             self.assertEqual(
-                parsed["shared_scratch"]["rhs"]["scratch_slots"], 154
+                parsed["shared_scratch"]["rhs"]["scratch_slots"], 174
+            )
+            self.assertEqual(
+                parsed["shared_scratch"]["rhs"]["exchange_slots"], 13
+            )
+            self.assertEqual(
+                parsed["shared_scratch"]["rhs"]["exchange_producers"][0][
+                    "definitions"
+                ],
+                93,
+            )
+            self.assertIn(
+                "def rhs_specie_exchange_shared(",
+                (Path(first) / "slices_rhs_shared.mojo").read_text(),
+            )
+            self.assertEqual(
+                parsed["shared_scratch"]["jacobian"]["wave_warps"],
+                [[7, 1, 0], [2, 3, 4, 5, 6]],
             )
 
     def test_bounded_regions_reduce_shared_scratch(self):
@@ -121,11 +139,20 @@ class SliceDagGenerationTests(unittest.TestCase):
                 shared_region_definitions=48,
             )
             self.assertEqual(
-                report["shared_scratch"]["jacobian"]["scratch_slots"], 363
+                report["shared_scratch"]["jacobian"]["scratch_slots"], 446
             )
             self.assertEqual(
-                report["shared_scratch"]["rhs"]["scratch_slots"], 101
+                report["shared_scratch"]["rhs"]["scratch_slots"], 108
             )
+
+    def test_shared_warp_order_must_be_a_permutation(self):
+        with tempfile.TemporaryDirectory() as output:
+            with self.assertRaisesRegex(slice_dag.DagError, "permutation"):
+                slice_dag.generate(
+                    ROOT / "reproducer.mojo",
+                    Path(output),
+                    shared_warp_order=(0, 1, 2, 3, 4, 5, 6, 6),
+                )
 
     def test_exchange_budget_is_enforced(self):
         with tempfile.TemporaryDirectory() as output:

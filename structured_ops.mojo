@@ -35,8 +35,10 @@ from generated.slices_jac_shared import (
     jac_nuc_slice_7_shared,
 )
 from generated.slices_rhs_shared import (
+    ExchangeSlots as RhsExchangeSlots,
     ScratchSlots as RhsScratchSlots,
     rhs_eint_slice_6_shared,
+    rhs_specie_exchange_shared,
     rhs_specie_slice_0_shared,
     rhs_specie_slice_1_shared,
     rhs_specie_slice_2_shared,
@@ -54,7 +56,8 @@ from std.math import min
 
 comptime DagWarps = 8
 comptime DagWaves = 2
-comptime DagWarpsPerWave = DagWarps // DagWaves
+comptime DagFirstWaveWarps = 3
+comptime DagSecondWaveWarps = 5
 comptime OwnerWarps = 8
 comptime LuGroupsPerWarp = 4
 comptime LuGroupWidth = 8
@@ -73,11 +76,13 @@ comptime DynamicJValues = TileCells * reproducer.Neqs * reproducer.Neqs
 comptime DagScratchOffset = DynamicJValues
 comptime RhsOffset = DagScratchOffset + DagScratchValues
 comptime DagInputOffset = RhsOffset + RhsValues
-comptime DynamicSharedValues = DagInputOffset + DagInputValues
+comptime RhsExchangeValues = TileCells * RhsExchangeSlots
+comptime RhsExchangeOffset = DagInputOffset + DagInputValues
+comptime DynamicSharedValues = RhsExchangeOffset + RhsExchangeValues
 comptime DynamicSharedBytes = DynamicSharedValues * 8
 comptime HopperSharedBytes = 227 * 1024
 comptime MaxExchangeBytes = 8 * 1024
-comptime GeneratedExchangeBytes = 1024
+comptime GeneratedExchangeBytes = RhsExchangeValues * 8
 
 
 def align_up(value: Int, alignment: Int) -> Int:
@@ -137,8 +142,10 @@ def validate_config():
     comptime assert BatchCells == TileCells
     comptime assert BatchesPerTile == 1
     comptime assert DagWarps == 8
-    comptime assert DagWaves * DagWarpsPerWave == DagWarps
-    comptime assert DagWarpsPerWave == 4
+    comptime assert DagWaves == 2
+    comptime assert DagFirstWaveWarps + DagSecondWaveWarps == DagWarps
+    comptime assert DagFirstWaveWarps == 3
+    comptime assert DagSecondWaveWarps == 5
     comptime assert OwnerWarps * LuGroupsPerWarp == TileCells
     comptime assert LuGroupWidth * LuGroupsPerWarp == WARP_SIZE
     comptime assert reproducer.Neqs <= 2 * LuGroupWidth
@@ -232,31 +239,62 @@ def dispatch_jac_slice_shared(
         jac_nuc_slice_7_shared(inputs, outputs, scratch, cell, z)
 
 
+def first_wave_logical_warp(physical_warp: Int) -> Int:
+    if physical_warp == 0:
+        return 7
+    elif physical_warp == 1:
+        return 1
+    return 0
+
+
+def second_wave_logical_warp(physical_warp: Int) -> Int:
+    if physical_warp == 0:
+        return 2
+    elif physical_warp == 1:
+        return 3
+    elif physical_warp == 2:
+        return 4
+    elif physical_warp == 3:
+        return 5
+    return 6
+
+
 def dispatch_rhs_slice_shared(
     warp_id: Int,
     inputs: SharedPointer,
     outputs: SharedPointer,
+    exchange: SharedPointer,
     scratch: SharedPointer,
     cell: Int,
     z: Float64,
 ):
     if warp_id == 0:
-        rhs_specie_slice_0_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_0_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 1:
-        rhs_specie_slice_1_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_1_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 2:
-        rhs_specie_slice_2_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_2_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 3:
-        rhs_specie_slice_3_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_3_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 4:
-        rhs_specie_slice_4_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_4_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 5:
-        rhs_specie_slice_5_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_5_shared(inputs, outputs, exchange, scratch, cell, z)
     elif warp_id == 6:
-        rhs_specie_slice_6_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_6_shared(inputs, outputs, exchange, scratch, cell, z)
         rhs_eint_slice_6_shared(inputs, outputs, scratch, cell, z)
     else:
-        rhs_specie_slice_7_shared(inputs, outputs, scratch, cell, z)
+        rhs_specie_slice_7_shared(inputs, outputs, exchange, scratch, cell, z)
+
+
+def produce_rhs_exchange_shared(
+    inputs: SharedPointer,
+    exchange: SharedPointer,
+    scratch: SharedPointer,
+    cell: Int,
+    z: Float64,
+):
+    rhs_specie_exchange_shared(inputs, exchange, scratch, cell, z)
 
 
 def dag_slice_kernel[

@@ -259,7 +259,9 @@ class Partition:
     exchange_bytes: int
 
 
-def partition(dag: FunctionDag, warps: int, threshold: int) -> Partition:
+def partition(
+    dag: FunctionDag, warps: int, threshold: int, batch_cells: int
+) -> Partition:
     outputs = assign_outputs(dag, warps)
     closures: list[set[str]] = []
     claims: dict[str, int] = defaultdict(int)
@@ -277,8 +279,34 @@ def partition(dag: FunctionDag, warps: int, threshold: int) -> Partition:
         if count >= 2 and costs[name] >= threshold
     }
     # One Float64 per batch cell for each exchanged scalar.
-    exchange_bytes = len(exchanges) * 8 * warps
+    exchange_bytes = len(exchanges) * 8 * batch_cells
     return Partition(outputs, closures, exchanges, exchange_bytes)
+
+
+def ordered_exchange_names(
+    dag: FunctionDag, exchanges: set[str]
+) -> list[str]:
+    return [
+        definition.name
+        for definition in dag.definitions
+        if definition.name in exchanges
+    ]
+
+
+def closure_with_exchange_inputs(
+    dag: FunctionDag,
+    outputs: Iterable[Output],
+    exchanges: set[str],
+) -> set[str]:
+    closure: set[str] = set()
+    pending = [dependency for output in outputs for dependency in output.dependencies]
+    while pending:
+        name = pending.pop()
+        if name in exchanges or name in closure:
+            continue
+        closure.add(name)
+        pending.extend(dag.by_name[name].dependencies)
+    return closure
 
 
 def _indent_statement(text: str) -> str:
@@ -357,9 +385,14 @@ def _replace_shared_operands(
     slots: dict[str, int],
     boolean_names: set[str],
     scratch_offset: int,
+    exchange_slots: dict[str, int] | None = None,
 ) -> str:
+    exchange_slots = exchange_slots or {}
+
     def replace_temp(match: re.Match[str]) -> str:
         name = match.group(0)
+        if name in exchange_slots:
+            return f"exchange[cell * ExchangeSlots + {exchange_slots[name]}]"
         slot = scratch_offset + slots[name]
         value = f"scratch[cell * ScratchSlots + {slot}]"
         return f"truthy({value})" if name in boolean_names else value
@@ -378,9 +411,14 @@ def _emit_shared_output(
     slots: dict[str, int],
     boolean_names: set[str],
     scratch_offset: int,
+    exchange_slots: dict[str, int] | None = None,
 ) -> str:
     text = _replace_shared_operands(
-        output.statement.text.strip(), slots, boolean_names, scratch_offset
+        output.statement.text.strip(),
+        slots,
+        boolean_names,
+        scratch_offset,
+        exchange_slots,
     )
     if dag.name == "jac_nuc":
         match = re.match(
@@ -650,7 +688,9 @@ def emit_shared_function(
     outputs: Iterable[Output],
     scratch_offset: int,
     max_region_definitions: int,
+    exchange_slots: dict[str, int] | None = None,
 ) -> tuple[str, RegionSchedule]:
+    exchange_slots = exchange_slots or {}
     schedule = make_region_schedule(
         dag, closure, outputs, max_region_definitions
     )
@@ -660,6 +700,11 @@ def emit_shared_function(
             name = match.group(0)
             if name in local_names:
                 return name
+            if name in exchange_slots:
+                return (
+                    "exchange[cell * ExchangeSlots + "
+                    f"{exchange_slots[name]}]"
+                )
             if name not in schedule.slots:
                 raise DagError(
                     f"{dag.name} warp {warp}: {name} is neither local nor persisted"
@@ -718,8 +763,14 @@ def emit_shared_function(
         lines = [
             "@no_inline",
             f"def {helper_name}(inputs: SharedPointer, outputs: SharedPointer, ",
-            "    scratch: SharedPointer, cell: Int, z: Float64):",
         ]
+        if exchange_slots:
+            lines.append(
+                "    exchange: SharedPointer, scratch: SharedPointer, "
+                "cell: Int, z: Float64):"
+            )
+        else:
+            lines.append("    scratch: SharedPointer, cell: Int, z: Float64):")
         region_text = "\n".join(
             definition.statement.text
             for definition in schedule.ordered[start : end + 1]
@@ -777,20 +828,23 @@ def emit_shared_function(
                 )
         functions.append("\n".join(lines))
 
-    signature = (
-        f"def {dag.name}_slice_{warp}_shared("
-        "inputs: SharedPointer, outputs: SharedPointer, "
-        "scratch: SharedPointer, cell: Int, z: Float64):"
-    )
+    signature = f"def {dag.name}_slice_{warp}_shared("
+    signature += "inputs: SharedPointer, outputs: SharedPointer, "
+    if exchange_slots:
+        signature += "exchange: SharedPointer, "
+    signature += "scratch: SharedPointer, cell: Int, z: Float64):"
     wrapper = [signature]
     empty_locals: set[str] = set()
     for output in schedule.outputs_after.get(-1, []):
         wrapper.append("    " + emit_region_output(output, empty_locals))
     for region_index in range(len(schedule.regions)):
-        wrapper.append(
+        call = (
             f"    _{dag.name}_slice_{warp}_region_{region_index}("
-            "inputs, outputs, scratch, cell, z)"
+            "inputs, outputs, "
         )
+        if exchange_slots:
+            call += "exchange, "
+        wrapper.append(call + "scratch, cell, z)")
     if len(wrapper) == 1:
         wrapper.append("    pass")
     functions.append("\n".join(wrapper))
@@ -803,14 +857,16 @@ def emit_lifetime_shared_function(
     closure: set[str],
     outputs: Iterable[Output],
     scratch_offset: int,
+    exchange_slots: dict[str, int] | None = None,
 ) -> tuple[str, SharedSchedule]:
+    exchange_slots = exchange_slots or {}
     schedule = make_shared_schedule(dag, closure, outputs)
     boolean_names: set[str] = set()
-    signature = (
-        f"def {dag.name}_slice_{warp}_shared("
-        "inputs: SharedPointer, outputs: SharedPointer, "
-        "scratch: SharedPointer, cell: Int, z: Float64):"
-    )
+    signature = f"def {dag.name}_slice_{warp}_shared("
+    signature += "inputs: SharedPointer, outputs: SharedPointer, "
+    if exchange_slots:
+        signature += "exchange: SharedPointer, "
+    signature += "scratch: SharedPointer, cell: Int, z: Float64):"
     lines = [signature, "    var T = inputs[cell * 15 + 14]"]
     for output in schedule.outputs_after.get(-1, []):
         lines.append(
@@ -821,6 +877,7 @@ def emit_lifetime_shared_function(
                 schedule.slots,
                 boolean_names,
                 scratch_offset,
+                exchange_slots,
             )
         )
     for index, definition in enumerate(schedule.ordered):
@@ -837,6 +894,7 @@ def emit_lifetime_shared_function(
             schedule.slots,
             boolean_names,
             scratch_offset,
+            exchange_slots,
         )
         if expression_is_boolean(original_expression, boolean_names):
             boolean_names.add(definition.name)
@@ -855,10 +913,67 @@ def emit_lifetime_shared_function(
                     schedule.slots,
                     boolean_names,
                     scratch_offset,
+                    exchange_slots,
                 )
             )
     if not schedule.ordered and not schedule.outputs_after:
         lines.append("    pass")
+    return "\n".join(lines), schedule
+
+
+def emit_exchange_producer(
+    dag: FunctionDag,
+    exchange_slots: dict[str, int],
+) -> tuple[str, SharedSchedule]:
+    names = sorted(exchange_slots, key=exchange_slots.__getitem__)
+    outputs = [
+        Output(
+            (exchange_slots[name],),
+            Statement("", dag.by_name[name].statement.line),
+            (name,),
+        )
+        for name in names
+    ]
+    closure: set[str] = set()
+    for output in outputs:
+        closure.update(transitive_closure(dag, output))
+    schedule = make_shared_schedule(dag, closure, outputs)
+    boolean_names: set[str] = set()
+    lines = [
+        f"def {dag.name}_exchange_shared(",
+        "    inputs: SharedPointer, exchange: SharedPointer, ",
+        "    scratch: SharedPointer, cell: Int, z: Float64):",
+        "    var T = inputs[cell * 15 + 14]",
+    ]
+    for index, definition in enumerate(schedule.ordered):
+        match = DEF_RE.match(definition.statement.text.strip())
+        if match is None:
+            raise DagError(
+                f"line {definition.statement.line}: malformed shared definition"
+            )
+        original_expression = definition.statement.text.strip()[
+            match.end() :
+        ].strip()
+        expression = _replace_shared_operands(
+            original_expression,
+            schedule.slots,
+            boolean_names,
+            0,
+        )
+        if expression_is_boolean(original_expression, boolean_names):
+            boolean_names.add(definition.name)
+            expression = f"(1.0 if {expression} else 0.0)"
+        lines.append(
+            "    scratch[cell * ScratchSlots + "
+            f"{schedule.slots[definition.name]}] = {expression}"
+        )
+        for output in schedule.outputs_after.get(index, []):
+            name = output.dependencies[0]
+            lines.append(
+                "    exchange[cell * ExchangeSlots + "
+                f"{output.key[0]}] = scratch[cell * ScratchSlots + "
+                f"{schedule.slots[name]}]"
+            )
     return "\n".join(lines), schedule
 
 
@@ -871,25 +986,47 @@ def emit_shared_file(
     threshold: int,
     max_region_definitions: int,
     concurrent_warps: int,
+    warp_order: tuple[int, ...],
 ) -> dict[str, object]:
-    if concurrent_warps <= 0 or warps % concurrent_warps != 0:
-        raise DagError("shared DAG wave width must divide the warp count")
-    wave_size = concurrent_warps
+    if concurrent_warps <= 0 or concurrent_warps > warps:
+        raise DagError("shared DAG wave width must be between 1 and warps")
+    if len(warp_order) != warps or sorted(warp_order) != list(range(warps)):
+        raise DagError("shared DAG warp order must be a permutation of all warps")
+    exchange_maps: list[dict[str, int]] = []
+    next_exchange_slot = 0
+    for dag, dag_partition in zip(dags, partitions):
+        names = ordered_exchange_names(dag, dag_partition.exchanges)
+        exchange_map = {
+            name: next_exchange_slot + index for index, name in enumerate(names)
+        }
+        exchange_maps.append(exchange_map)
+        next_exchange_slot += len(names)
+    effective_closures: list[list[set[str]]] = []
+    for dag, dag_partition in zip(dags, partitions):
+        effective_closures.append(
+            [
+                closure_with_exchange_inputs(
+                    dag, dag_partition.outputs[warp], dag_partition.exchanges
+                )
+                for warp in range(warps)
+            ]
+        )
     warp_slots = [0 for _ in range(warps)]
     region_counts = [0 for _ in range(warps)]
     boundary_live: list[list[int]] = [[] for _ in range(warps)]
-    for dag, dag_partition in zip(dags, partitions):
+    for dag_index, (dag, dag_partition) in enumerate(zip(dags, partitions)):
         for warp in range(warps):
+            closure = effective_closures[dag_index][warp]
             if max_region_definitions == 0:
                 schedule = make_shared_schedule(
                     dag,
-                    dag_partition.closures[warp],
+                    closure,
                     dag_partition.outputs[warp],
                 )
             else:
                 schedule = make_region_schedule(
                     dag,
-                    dag_partition.closures[warp],
+                    closure,
                     dag_partition.outputs[warp],
                     max_region_definitions,
                 )
@@ -903,17 +1040,38 @@ def emit_shared_file(
                     boundary_live[warp] = []
     scratch_offsets = [0 for _ in range(warps)]
     wave_slots: list[int] = []
-    for wave_begin in range(0, warps, wave_size):
+    wave_warps = [warp_order[:concurrent_warps]]
+    if concurrent_warps < warps:
+        wave_warps.append(warp_order[concurrent_warps:])
+    for logical_warps in wave_warps:
         offset = 0
-        for warp in range(wave_begin, wave_begin + wave_size):
+        for warp in logical_warps:
             scratch_offsets[warp] = offset
             offset += warp_slots[warp]
         wave_slots.append(offset)
-    scratch_slots = max(wave_slots)
+    producer_functions: list[str] = []
+    producer_reports: list[dict[str, object]] = []
+    producer_peak_slots = 0
+    for dag, exchange_map in zip(dags, exchange_maps):
+        if not exchange_map:
+            continue
+        function, schedule = emit_exchange_producer(dag, exchange_map)
+        producer_functions.append(function)
+        producer_peak_slots = max(producer_peak_slots, schedule.peak_slots)
+        producer_reports.append(
+            {
+                "function": dag.name,
+                "definitions": len(schedule.ordered),
+                "scratch_slots": schedule.peak_slots,
+                "exchange_names": sorted(exchange_map, key=exchange_map.__getitem__),
+            }
+        )
+    scratch_slots = max([*wave_slots, producer_peak_slots])
     header = (
         "# Generated by tools/slice_dag.py; do not edit.\n"
         f"# input_sha256={source_hash} warps={warps} threshold={threshold} "
-        f"region_defs={max_region_definitions} wave_warps={concurrent_warps}\n\n"
+        f"region_defs={max_region_definitions} wave_warps={concurrent_warps} "
+        f"warp_order={','.join(map(str, warp_order))}\n\n"
         "from std.gpu.memory import AddressSpace\n"
         "from std.math import abs, cbrt, exp, log\n"
         "from reproducer import Log10, Pi, portable_mul, powi_m3, powi_m5, powi_m7\n"
@@ -923,26 +1081,32 @@ def emit_shared_file(
         "    address_space=AddressSpace.SHARED,\n"
         "]\n"
         f"comptime ScratchSlots = {scratch_slots}\n\n"
+        f"comptime ExchangeSlots = {next_exchange_slot}\n\n"
     )
-    functions: list[str] = []
-    for dag, dag_partition in zip(dags, partitions):
+    functions = producer_functions
+    for dag_index, (dag, dag_partition, exchange_map) in enumerate(
+        zip(dags, partitions, exchange_maps)
+    ):
         for warp in range(warps):
+            closure = effective_closures[dag_index][warp]
             if max_region_definitions == 0:
                 function, _ = emit_lifetime_shared_function(
                     dag,
                     warp,
-                    dag_partition.closures[warp],
+                    closure,
                     dag_partition.outputs[warp],
                     scratch_offsets[warp],
+                    exchange_map,
                 )
             else:
                 function, _ = emit_shared_function(
                     dag,
                     warp,
-                    dag_partition.closures[warp],
+                    closure,
                     dag_partition.outputs[warp],
                     scratch_offsets[warp],
                     max_region_definitions,
+                    exchange_map,
                 )
             functions.append(function)
     path.write_text(header + "\n\n".join(functions) + "\n")
@@ -953,8 +1117,12 @@ def emit_shared_file(
         "wave_slots": wave_slots,
         "max_region_definitions": max_region_definitions,
         "concurrent_warps": concurrent_warps,
+        "warp_order": list(warp_order),
+        "wave_warps": [list(wave) for wave in wave_warps],
         "region_counts": region_counts,
         "boundary_live": boundary_live,
+        "exchange_slots": next_exchange_slot,
+        "exchange_producers": producer_reports,
     }
 
 
@@ -963,11 +1131,13 @@ def make_report(
     dags: list[FunctionDag],
     partitions: list[Partition],
     warps: int,
+    batch_cells: int,
     threshold: int,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "input_sha256": source_hash,
         "warps": warps,
+        "batch_cells": batch_cells,
         "threshold": threshold,
         "functions": {},
     }
@@ -1008,13 +1178,22 @@ def generate(
     output_dir: Path,
     *,
     warps: int = 8,
+    batch_cells: int = 32,
     threshold: int = 400,
     max_exchange_bytes: int = 8192,
     shared_region_definitions: int = 0,
-    shared_wave_warps: int = 4,
+    shared_wave_warps: int = 3,
+    shared_warp_order: tuple[int, ...] | None = None,
 ) -> dict[str, object]:
     if warps <= 0:
         raise DagError("warps must be positive")
+    if batch_cells <= 0:
+        raise DagError("batch cells must be positive")
+    if shared_warp_order is None:
+        if warps == 8:
+            shared_warp_order = (7, 1, 0, 2, 3, 4, 5, 6)
+        else:
+            shared_warp_order = tuple(range(warps))
     source_bytes = input_path.read_bytes()
     source = source_bytes.decode("utf-8")
     source_hash = hashlib.sha256(source_bytes).hexdigest()
@@ -1022,7 +1201,8 @@ def generate(
         name: parse_function(source, name) for name in MANIFEST
     }
     partitions = {
-        name: partition(dag, warps, threshold) for name, dag in dags.items()
+        name: partition(dag, warps, threshold, batch_cells)
+        for name, dag in dags.items()
     }
     total_exchange = sum(part.exchange_bytes for part in partitions.values())
     if total_exchange > max_exchange_bytes:
@@ -1049,6 +1229,7 @@ def generate(
         threshold,
         shared_region_definitions,
         shared_wave_warps,
+        shared_warp_order,
     )
     rhs_shared = emit_shared_file(
         output_dir / "slices_rhs_shared.mojo",
@@ -1059,6 +1240,7 @@ def generate(
         threshold,
         shared_region_definitions,
         shared_wave_warps,
+        shared_warp_order,
     )
     emit_file(
         output_dir / "slices_rhs.mojo",
@@ -1073,6 +1255,7 @@ def generate(
         list(dags.values()),
         list(partitions.values()),
         warps,
+        batch_cells,
         threshold,
     )
     report["shared_scratch"] = {
@@ -1099,20 +1282,28 @@ def main() -> None:
     parser.add_argument("input", nargs="?", type=Path, default=Path("reproducer.mojo"))
     parser.add_argument("--output-dir", type=Path, default=Path("generated"))
     parser.add_argument("--warps", type=int, default=8)
+    parser.add_argument("--batch-cells", type=int, default=32)
     parser.add_argument("--threshold", type=int, default=400)
     parser.add_argument("--max-exchange-bytes", type=int, default=8192)
     parser.add_argument("--shared-region-definitions", type=int, default=0)
-    parser.add_argument("--shared-wave-warps", type=int, default=4)
+    parser.add_argument("--shared-wave-warps", type=int, default=3)
+    parser.add_argument(
+        "--shared-warp-order", default="7,1,0,2,3,4,5,6"
+    )
     args = parser.parse_args()
     try:
         report = generate(
             args.input,
             args.output_dir,
             warps=args.warps,
+            batch_cells=args.batch_cells,
             threshold=args.threshold,
             max_exchange_bytes=args.max_exchange_bytes,
             shared_region_definitions=args.shared_region_definitions,
             shared_wave_warps=args.shared_wave_warps,
+            shared_warp_order=tuple(
+                int(warp) for warp in args.shared_warp_order.split(",")
+            ),
         )
     except DagError as error:
         parser.error(str(error))

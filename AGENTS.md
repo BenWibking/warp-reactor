@@ -8,3 +8,6 @@
 - Load the newest available CUDA module and verify `nvidia-smi` before running
   CUDA tests. Record the actual module, driver, GPU model, and compute
   capability; do not assume a requested module version is installed.
+- Before each timing or profiling batch, inspect utilization, memory use, and
+  active compute processes on every GPU, then run on the least-loaded device.
+  Record the selected GPU with the result.

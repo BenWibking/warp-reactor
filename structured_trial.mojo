@@ -8,6 +8,7 @@ import warp_lu
 from layout import TensorLayout, TileTensor, row_major, stack_allocation
 from std.gpu import WARP_SIZE, barrier, block_idx, thread_idx
 from std.gpu.memory import AddressSpace, external_memory
+from std.gpu.sync import syncwarp
 from std.math import abs, exp, isfinite, log, max, min
 
 
@@ -213,7 +214,7 @@ def factorize_shared[
     comptime matrix_values = reproducer.Neqs * reproducer.Neqs
     if local_lane == 0:
         infos[cell] = Int32(0)
-    barrier()
+    syncwarp()
     for k in range(reproducer.Neqs - 1):
         if participating and local_lane == k % structured_ops.LuGroupWidth:
             var pivot = k
@@ -230,7 +231,7 @@ def factorize_shared[
                     maximum = value
                     pivot = row
             pivots[cell, k] = Int32(pivot)
-        barrier()
+        syncwarp()
         var pivot = k
         if participating:
             pivot = Int(rebind[Scalar[DType.int32]](pivots[cell, k]))
@@ -248,7 +249,7 @@ def factorize_shared[
                     var temporary = jacobian[bottom]
                     jacobian[bottom] = jacobian[top]
                     jacobian[top] = temporary
-        barrier()
+        syncwarp()
         if participating and local_lane == k % structured_ops.LuGroupWidth:
             var diagonal_index = (
                 cell * matrix_values + k * reproducer.Neqs + k
@@ -263,7 +264,7 @@ def factorize_shared[
                         cell * matrix_values + row * reproducer.Neqs + k
                     )
                     jacobian[index] *= scale
-        barrier()
+        syncwarp()
         if participating:
             for column in range(
                 local_lane, reproducer.Neqs, structured_ops.LuGroupWidth
@@ -286,11 +287,11 @@ def factorize_shared[
                         jacobian[index] += reproducer.portable_mul(
                             upper, multiplier
                         )
-        barrier()
+        syncwarp()
     if participating and local_lane == 0:
         if jacobian[cell * matrix_values + matrix_values - 1] == 0.0:
             infos[cell] = Int32(reproducer.Neqs)
-    barrier()
+    syncwarp()
 
 
 def solve_shared[
@@ -340,7 +341,7 @@ def solve_shared[
                     rhs[cell * reproducer.Neqs + k]
                 )
                 rhs[cell * reproducer.Neqs + k] = temporary
-        barrier()
+        syncwarp()
         if nonsingular:
             var value = rhs[cell * reproducer.Neqs + k]
             for row in range(
@@ -358,7 +359,7 @@ def solve_shared[
                             ],
                         )
                     )
-        barrier()
+        syncwarp()
     for reverse_k in range(reproducer.Neqs):
         var k = reproducer.Neqs - 1 - reverse_k
         if nonsingular and local_lane == k % structured_ops.LuGroupWidth:
@@ -366,7 +367,7 @@ def solve_shared[
                 rhs[cell * reproducer.Neqs + k]
                 / jacobian[cell * matrix_values + k * reproducer.Neqs + k]
             )
-        barrier()
+        syncwarp()
         if nonsingular:
             var negative_x = -rhs[cell * reproducer.Neqs + k]
             for row in range(
@@ -384,7 +385,7 @@ def solve_shared[
                             ],
                         )
                     )
-        barrier()
+        syncwarp()
 
 
 def evaluate_jacobian_batch[
@@ -545,11 +546,11 @@ def evaluate_jacobian_shared(
     active_cells: Int,
 ):
     if (
-        physical_warp < structured_ops.DagWarpsPerWave
+        physical_warp < structured_ops.DagFirstWaveWarps
         and physical_lane < active_cells
     ):
         structured_ops.dispatch_jac_slice_shared(
-            physical_warp,
+            structured_ops.first_wave_logical_warp(physical_warp),
             inputs,
             jacobian,
             scratch,
@@ -558,12 +559,11 @@ def evaluate_jacobian_shared(
         )
     barrier()
     if (
-        physical_warp >= structured_ops.DagWarpsPerWave
-        and physical_warp < structured_ops.DagWarps
+        physical_warp < structured_ops.DagSecondWaveWarps
         and physical_lane < active_cells
     ):
         structured_ops.dispatch_jac_slice_shared(
-            physical_warp,
+            structured_ops.second_wave_logical_warp(physical_warp),
             inputs,
             jacobian,
             scratch,
@@ -576,33 +576,44 @@ def evaluate_jacobian_shared(
 def evaluate_rhs_shared(
     inputs: structured_ops.SharedPointer,
     rhs: structured_ops.SharedPointer,
+    exchange: structured_ops.SharedPointer,
     scratch: structured_ops.SharedPointer,
     physical_warp: Int,
     physical_lane: Int,
     active_cells: Int,
 ):
-    if (
-        physical_warp < structured_ops.DagWarpsPerWave
-        and physical_lane < active_cells
-    ):
-        structured_ops.dispatch_rhs_slice_shared(
-            physical_warp,
+    if physical_warp == 0 and physical_lane < active_cells:
+        structured_ops.produce_rhs_exchange_shared(
             inputs,
-            rhs,
+            exchange,
             scratch,
             physical_lane,
             reproducer.redshift(),
         )
     barrier()
     if (
-        physical_warp >= structured_ops.DagWarpsPerWave
-        and physical_warp < structured_ops.DagWarps
+        physical_warp < structured_ops.DagFirstWaveWarps
         and physical_lane < active_cells
     ):
         structured_ops.dispatch_rhs_slice_shared(
-            physical_warp,
+            structured_ops.first_wave_logical_warp(physical_warp),
             inputs,
             rhs,
+            exchange,
+            scratch,
+            physical_lane,
+            reproducer.redshift(),
+        )
+    barrier()
+    if (
+        physical_warp < structured_ops.DagSecondWaveWarps
+        and physical_lane < active_cells
+    ):
+        structured_ops.dispatch_rhs_slice_shared(
+            structured_ops.second_wave_logical_warp(physical_warp),
+            inputs,
+            rhs,
+            exchange,
             scratch,
             physical_lane,
             reproducer.redshift(),
@@ -641,6 +652,7 @@ def structured_trial_kernel[
     var scratch = jacobian + structured_ops.DagScratchOffset
     var rhs = jacobian + structured_ops.RhsOffset
     var dag_inputs = jacobian + structured_ops.DagInputOffset
+    var rhs_exchange = jacobian + structured_ops.RhsExchangeOffset
     var stage_y = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells, reproducer.Neqs]())
@@ -659,7 +671,6 @@ def structured_trial_kernel[
     var infos = stack_allocation[
         DType.int32, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells]())
-
     var tid = thread_idx.x
     var physical_warp = tid // WARP_SIZE
     var physical_lane = tid % WARP_SIZE
@@ -689,10 +700,14 @@ def structured_trial_kernel[
     comptime e1 = -0.23570226039551292
     comptime e2 = -0.23570226039551567
     comptime e3 = -0.13807118745769906
-
     prepare_dag_inputs(base, dag_inputs, tid, active_cells)
     evaluate_jacobian_shared(
-        dag_inputs, jacobian, scratch, physical_warp, physical_lane, active_cells
+        dag_inputs,
+        jacobian,
+        scratch,
+        physical_warp,
+        physical_lane,
+        active_cells,
     )
     var tile_cell = warp_id
     var participating = tile_cell < active_cells
@@ -717,7 +732,13 @@ def structured_trial_kernel[
 
     prepare_dag_inputs(base, dag_inputs, tid, active_cells)
     evaluate_rhs_shared(
-        dag_inputs, rhs, scratch, physical_warp, physical_lane, active_cells
+        dag_inputs,
+        rhs,
+        rhs_exchange,
+        scratch,
+        physical_warp,
+        physical_lane,
+        active_cells,
     )
     solve_shared(
         jacobian, rhs, participating, tile_cell, lane, pivots, infos
@@ -739,7 +760,13 @@ def structured_trial_kernel[
 
     prepare_dag_inputs(stage_y, dag_inputs, tid, active_cells)
     evaluate_rhs_shared(
-        dag_inputs, rhs, scratch, physical_warp, physical_lane, active_cells
+        dag_inputs,
+        rhs,
+        rhs_exchange,
+        scratch,
+        physical_warp,
+        physical_lane,
+        active_cells,
     )
     if participating:
         for component in range(
@@ -780,7 +807,13 @@ def structured_trial_kernel[
 
     prepare_dag_inputs(stage_y, dag_inputs, tid, active_cells)
     evaluate_rhs_shared(
-        dag_inputs, rhs, scratch, physical_warp, physical_lane, active_cells
+        dag_inputs,
+        rhs,
+        rhs_exchange,
+        scratch,
+        physical_warp,
+        physical_lane,
+        active_cells,
     )
     if participating:
         for component in range(
@@ -895,6 +928,7 @@ def structured_chemistry_kernel[
     var scratch = jacobian + structured_ops.DagScratchOffset
     var rhs = jacobian + structured_ops.RhsOffset
     var dag_inputs = jacobian + structured_ops.DagInputOffset
+    var rhs_exchange = jacobian + structured_ops.RhsExchangeOffset
     var stage_y = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells, reproducer.Neqs]())
@@ -938,6 +972,7 @@ def structured_chemistry_kernel[
     var active_cells = min(structured_ops.TileCells, num_cells - tile_begin)
     if tid < structured_ops.TileCells:
         var participating = False
+        var participant_code = Int32(0)
         if tid < active_cells:
             var cell = tile_begin + tid
             var collapse = reproducer_gpu.load_collapse(
@@ -971,12 +1006,17 @@ def structured_chemistry_kernel[
             reproducer_gpu.store_collapse(
                 state_tensor, steps, stats, cell, collapse
             )
-        participants[tid] = Int32(participating)
+            var encoded_cell = Int32(cell + 1)
+            participant_code = (
+                encoded_cell if participating else -encoded_cell
+            )
+        participants[tid] = participant_code
     barrier()
     if tid == 0:
         var count = 0
         for cell in range(active_cells):
-            count += Int(rebind[Scalar[DType.int32]](participants[cell]))
+            if rebind[Scalar[DType.int32]](participants[cell]) > 0:
+                count += 1
         control_i32[0] = Int32(count)
         control_i32[2] = Int32(0)
         control_i32[3] = Int32(0)
@@ -1008,7 +1048,6 @@ def structured_chemistry_kernel[
     var n_step = 0
     var n_accept = 0
     var status = reproducer.Success
-
     while True:
         if (
             rebind[Scalar[DType.int32]](control_i32[0]) == 0
@@ -1046,7 +1085,7 @@ def structured_chemistry_kernel[
         if tile_cell < active_cells:
             participating = rebind[Scalar[DType.int32]](
                 participants[tile_cell]
-            ) != 0
+            ) > 0
         comptime matrix_values = reproducer.Neqs * reproducer.Neqs
         if participating:
             for column in range(
@@ -1076,6 +1115,7 @@ def structured_chemistry_kernel[
         evaluate_rhs_shared(
             dag_inputs,
             rhs,
+            rhs_exchange,
             scratch,
             physical_warp,
             physical_lane,
@@ -1105,6 +1145,7 @@ def structured_chemistry_kernel[
         evaluate_rhs_shared(
             dag_inputs,
             rhs,
+            rhs_exchange,
             scratch,
             physical_warp,
             physical_lane,
@@ -1159,6 +1200,7 @@ def structured_chemistry_kernel[
         evaluate_rhs_shared(
             dag_inputs,
             rhs,
+            rhs_exchange,
             scratch,
             physical_warp,
             physical_lane,
@@ -1252,7 +1294,7 @@ def structured_chemistry_kernel[
         if tid == 0:
             var tile_error = 0.0
             for cell in range(active_cells):
-                if rebind[Scalar[DType.int32]](participants[cell]) != 0:
+                if rebind[Scalar[DType.int32]](participants[cell]) > 0:
                     var error = rebind[Scalar[DType.float64]](
                         trial_errors[cell]
                     )
@@ -1289,7 +1331,7 @@ def structured_chemistry_kernel[
                 hnew = h / max(fac_step, facgus)
             if tid < active_cells and rebind[Scalar[DType.int32]](
                 participants[tid]
-            ) != 0:
+            ) > 0:
                 for component in range(reproducer.Neqs):
                     base[tid, component] = rebind[Scalar[DType.float64]](
                         candidate_stage[tid, component]
@@ -1314,13 +1356,16 @@ def structured_chemistry_kernel[
 
     barrier()
     if tid < active_cells:
-        var cell = tile_begin + tid
+        var participant_code = Int(
+            rebind[Scalar[DType.int32]](participants[tid])
+        )
+        var participating = participant_code > 0
+        var cell = (
+            participant_code if participating else -participant_code
+        ) - 1
         var collapse = reproducer_gpu.load_collapse(
             state_tensor, steps, stats, cell
         )
-        var participating = rebind[Scalar[DType.int32]](
-            participants[tid]
-        ) != 0
         if status == reproducer.Success and participating:
             for species in range(reproducer.NumSpec):
                 collapse.current.xn[species] = rebind[
