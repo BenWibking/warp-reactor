@@ -11,4 +11,4 @@ run-mojo-grid1 = { cmd = "./reproducer_mojo --grid 1 --no-compare-final-state", 
 probe-transcendentals = "python3 tools/transcendental_probe.py"
 
 [dependencies]
-mojo = ">=1.0.0b2,<2"
+mojo = ">=1.0.0b3.dev2026071705,<2"
