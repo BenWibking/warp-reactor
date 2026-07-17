@@ -7412,7 +7412,9 @@ constexpr integrators::Real rtol_energy = 1.0e-6;
 constexpr integrators::Real atol_energy = 1.0e-6;
 constexpr integrators::Real comparison_thermodynamic_rtol = 2.0e-4;
 constexpr int default_grid_dim = 64;
+#if !defined(PRIMORDIAL_ROS2S_ENABLE_CUDA) && !defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
 constexpr const char* default_compare_final_state_path = "final_states_grid64_cpu.bin";
+#endif
 constexpr int perturbation_interval = 20;
 constexpr integrators::Real perturbation_amplitude = 0.2;
 constexpr int backup_suffix_digits = 6;
@@ -7462,7 +7464,11 @@ struct Options {
     int grid_dim{default_grid_dim};
     bool perturb{true};
     bool show_help{false};
+#if defined(PRIMORDIAL_ROS2S_ENABLE_CUDA) || defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
+    std::string compare_final_state_path{};
+#else
     std::string compare_final_state_path{default_compare_final_state_path};
+#endif
 };
 
 using Ros2sIntegrator = integrators::RODAS<pc::PrimordialChem>;
@@ -7618,14 +7624,31 @@ PRIMORDIAL_HOST_DEVICE integrators::IntegratorResult burn_ros2s(pc::burn_t& stat
     return result;
 }
 
-PRIMORDIAL_HOST_DEVICE bool advance_collapse_step(CollapseState& collapse, int cell, int step, bool perturb,
-                                                  integrators::IntegratorResult& failure) {
+PRIMORDIAL_HOST_DEVICE bool valid_positive(integrators::Real value) {
+    return value > 0.0 && std::isfinite(value);
+}
+
+PRIMORDIAL_HOST_DEVICE integrators::Real collapse_timestep(const CollapseState& collapse) {
+    const integrators::Real rho = pc::density(collapse.current.xn);
+    if (!valid_positive(rho)) {
+        return -1.0;
+    }
+    const integrators::Real tff = std::sqrt(pc::pi * 3.0 / (32.0 * rho * pc::grav_constant));
+    if (!valid_positive(tff)) {
+        return -1.0;
+    }
+    const integrators::Real dt = tff_reduc * tff;
+    return valid_positive(dt) ? dt : -1.0;
+}
+
+[[maybe_unused]] PRIMORDIAL_HOST_DEVICE bool advance_collapse_step(
+    CollapseState& collapse, int cell, int step, bool perturb,
+    integrators::IntegratorResult& failure) {
     apply_perturbation(collapse, cell, step, perturb);
 
     const integrators::Real old_density = collapse.density_driver;
-    const integrators::Real rho = pc::density(collapse.current.xn);
-    const integrators::Real tff = std::sqrt(pc::pi * 3.0 / (32.0 * rho * pc::grav_constant));
-    const integrators::Real dt = tff_reduc * tff;
+    const integrators::Real dt = collapse_timestep(collapse);
+    const integrators::Real tff = dt / tff_reduc;
 
     collapse.density_driver += dt * (collapse.density_driver / tff);
     if (dt < 10.0 || collapse.density_driver > 2.0e-6) {
@@ -7668,12 +7691,18 @@ bool check_cuda(cudaError_t status, const char* action) {
     return false;
 }
 
-__global__ void advance_collapse_grid_kernel(CollapseState* cells, int num_cells,
-                                             int completed_global_steps, int step,
-                                             bool perturb, int* all_stopped,
+__global__ void prepare_grid_timestep_kernel(CollapseState* cells, int num_cells,
+                                             int completed_global_steps,
+                                             integrators::Real grid_time, int step,
+                                             bool perturb,
+                                             integrators::Real* dt_candidates,
                                              int* failure_code) {
     const int cell = blockIdx.x * blockDim.x + threadIdx.x;
-    if (cell >= num_cells || *failure_code != static_cast<int>(integrators::IntegratorResult::SUCCESS)) {
+    if (cell >= num_cells) {
+        return;
+    }
+    dt_candidates[cell] = std::numeric_limits<integrators::Real>::max();
+    if (*failure_code != static_cast<int>(integrators::IntegratorResult::SUCCESS)) {
         return;
     }
 
@@ -7681,15 +7710,75 @@ __global__ void advance_collapse_grid_kernel(CollapseState* cells, int num_cells
     if (state.completed_steps < completed_global_steps) {
         return;
     }
+    if (state.completed_steps != completed_global_steps || state.time != grid_time) {
+        atomicCAS(failure_code, static_cast<int>(integrators::IntegratorResult::SUCCESS),
+                  static_cast<int>(integrators::IntegratorResult::BAD_INPUTS));
+        return;
+    }
+
+    apply_perturbation(state, cell, step, perturb);
+    const integrators::Real dt = collapse_timestep(state);
+    if (!valid_positive(dt) || !valid_positive(state.density_driver)) {
+        atomicCAS(failure_code, static_cast<int>(integrators::IntegratorResult::SUCCESS),
+                  static_cast<int>(integrators::IntegratorResult::BAD_INPUTS));
+        return;
+    }
+    if (dt < 10.0) {
+        const integrators::Real tff = dt / tff_reduc;
+        state.density_driver += dt * (state.density_driver / tff);
+        return;
+    }
+    dt_candidates[cell] = dt;
+}
+
+__global__ void advance_collapse_gridwide_kernel(
+    CollapseState* cells, int num_cells, int completed_global_steps,
+    integrators::Real next_grid_time, integrators::Real dt_grid,
+    int* integrated_count, int* failure_code) {
+    const int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    if (cell >= num_cells ||
+        *failure_code != static_cast<int>(integrators::IntegratorResult::SUCCESS)) {
+        return;
+    }
+
+    CollapseState& state = cells[cell];
+    if (state.completed_steps != completed_global_steps) {
+        return;
+    }
+
+    const integrators::Real local_dt = collapse_timestep(state);
+    if (local_dt < 10.0) {
+        return;
+    }
+    const integrators::Real old_density = state.density_driver;
+    const integrators::Real tff = local_dt / tff_reduc;
+    state.density_driver += dt_grid * (state.density_driver / tff);
+    if (!valid_positive(state.density_driver) || state.density_driver > 2.0e-6) {
+        return;
+    }
+
+    const integrators::Real density_ratio = state.density_driver / old_density;
+    for (auto& xn : state.current.xn) {
+        xn *= density_ratio;
+    }
+    state.current.rho *= density_ratio;
 
     auto failure = integrators::IntegratorResult::SUCCESS;
-    const bool stopped = advance_collapse_step(state, cell, step, perturb, failure);
+    const auto result = burn_ros2s(state.current, dt_grid, state.stats);
+    if (result != integrators::IntegratorResult::SUCCESS) {
+        failure = result;
+    } else {
+        pc::floor_and_normalize_number_densities(state.current);
+        pc::balance_charge(state.current);
+        pc::floor_and_normalize_number_densities(state.current);
+        pc::eos_re(state.current);
+        state.time = next_grid_time;
+        state.completed_steps = completed_global_steps + 1;
+        atomicAdd(integrated_count, 1);
+    }
     if (failure != integrators::IntegratorResult::SUCCESS) {
         atomicCAS(failure_code, static_cast<int>(integrators::IntegratorResult::SUCCESS),
                   static_cast<int>(failure));
-    }
-    if (!stopped) {
-        atomicExch(all_stopped, 0);
     }
 }
 
@@ -7697,17 +7786,23 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                                              bool perturb,
                                              int& completed_global_steps) {
     CollapseState* device_cells = nullptr;
-    int* device_all_stopped = nullptr;
+    integrators::Real* device_dt_candidates = nullptr;
+    int* device_integrated_count = nullptr;
     int* device_failure = nullptr;
     const auto bytes = cells.size() * sizeof(CollapseState);
+    const auto candidate_bytes = cells.size() * sizeof(integrators::Real);
 
     if (!check_cuda(cudaMalloc(&device_cells, bytes), "cudaMalloc(cells)") ||
-        !check_cuda(cudaMalloc(&device_all_stopped, sizeof(int)), "cudaMalloc(all_stopped)") ||
+        !check_cuda(cudaMalloc(&device_dt_candidates, candidate_bytes),
+                    "cudaMalloc(dt_candidates)") ||
+        !check_cuda(cudaMalloc(&device_integrated_count, sizeof(int)),
+                    "cudaMalloc(integrated_count)") ||
         !check_cuda(cudaMalloc(&device_failure, sizeof(int)), "cudaMalloc(failure)") ||
         !check_cuda(cudaMemcpy(device_cells, cells.data(), bytes, cudaMemcpyHostToDevice),
                     "cudaMemcpy(cells to device)")) {
         cudaFree(device_cells);
-        cudaFree(device_all_stopped);
+        cudaFree(device_dt_candidates);
+        cudaFree(device_integrated_count);
         cudaFree(device_failure);
         return integrators::IntegratorResult::BAD_INPUTS;
     }
@@ -7725,34 +7820,78 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                   "PRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK cannot exceed 1024");
     const int num_cells = static_cast<int>(cells.size());
     const int grid_size = (num_cells + block_size - 1) / block_size;
+    std::vector<integrators::Real> dt_candidates(cells.size());
+    integrators::Real grid_time = 0.0;
 
     for (int step = 0; result == integrators::IntegratorResult::SUCCESS &&
                        step < max_collapse_steps; ++step) {
-        const int all_stopped = 1;
-        if (!check_cuda(cudaMemcpy(device_all_stopped, &all_stopped, sizeof(int),
-                                   cudaMemcpyHostToDevice),
-                        "cudaMemcpy(all_stopped to device)")) {
-            result = integrators::IntegratorResult::BAD_INPUTS;
-            break;
-        }
-
-        advance_collapse_grid_kernel<<<grid_size, block_size>>>(
-            device_cells, num_cells, completed_global_steps, step, perturb,
-            device_all_stopped, device_failure);
-        if (!check_cuda(cudaGetLastError(), "advance_collapse_grid_kernel launch") ||
-            !check_cuda(cudaDeviceSynchronize(), "advance_collapse_grid_kernel synchronize")) {
+        prepare_grid_timestep_kernel<<<grid_size, block_size>>>(
+            device_cells, num_cells, completed_global_steps, grid_time, step,
+            perturb, device_dt_candidates, device_failure);
+        if (!check_cuda(cudaGetLastError(), "prepare_grid_timestep_kernel launch") ||
+            !check_cuda(cudaDeviceSynchronize(),
+                        "prepare_grid_timestep_kernel synchronize")) {
             result = integrators::IntegratorResult::BAD_INPUTS;
             break;
         }
 
         int host_failure = success;
-        int host_all_stopped = 0;
         if (!check_cuda(cudaMemcpy(&host_failure, device_failure, sizeof(int),
                                    cudaMemcpyDeviceToHost),
                         "cudaMemcpy(failure to host)") ||
-            !check_cuda(cudaMemcpy(&host_all_stopped, device_all_stopped, sizeof(int),
+            !check_cuda(cudaMemcpy(dt_candidates.data(), device_dt_candidates,
+                                   candidate_bytes, cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(dt_candidates to host)")) {
+            result = integrators::IntegratorResult::BAD_INPUTS;
+            break;
+        }
+        if (host_failure != success) {
+            result = static_cast<integrators::IntegratorResult>(host_failure);
+            std::cerr << "grid timestep preparation failed on " << backend_name()
+                      << " collapse step " << step << " with code " << host_failure << "\n";
+            break;
+        }
+
+        integrators::Real dt_grid = std::numeric_limits<integrators::Real>::max();
+        for (const auto candidate : dt_candidates) {
+            if (candidate < dt_grid) {
+                dt_grid = candidate;
+            }
+        }
+        if (dt_grid == std::numeric_limits<integrators::Real>::max()) {
+            break;
+        }
+        const integrators::Real next_grid_time = grid_time + dt_grid;
+        if (!valid_positive(dt_grid) || !std::isfinite(next_grid_time)) {
+            result = integrators::IntegratorResult::BAD_INPUTS;
+            break;
+        }
+
+        const int integrated_count = 0;
+        if (!check_cuda(cudaMemcpy(device_integrated_count, &integrated_count,
+                                   sizeof(int), cudaMemcpyHostToDevice),
+                        "cudaMemcpy(integrated_count to device)")) {
+            result = integrators::IntegratorResult::BAD_INPUTS;
+            break;
+        }
+        advance_collapse_gridwide_kernel<<<grid_size, block_size>>>(
+            device_cells, num_cells, completed_global_steps, next_grid_time,
+            dt_grid, device_integrated_count, device_failure);
+        if (!check_cuda(cudaGetLastError(), "advance_collapse_gridwide_kernel launch") ||
+            !check_cuda(cudaDeviceSynchronize(),
+                        "advance_collapse_gridwide_kernel synchronize")) {
+            result = integrators::IntegratorResult::BAD_INPUTS;
+            break;
+        }
+
+        int host_integrated_count = 0;
+        if (!check_cuda(cudaMemcpy(&host_failure, device_failure, sizeof(int),
                                    cudaMemcpyDeviceToHost),
-                        "cudaMemcpy(all_stopped to host)")) {
+                        "cudaMemcpy(failure to host)") ||
+            !check_cuda(cudaMemcpy(&host_integrated_count, device_integrated_count,
+                                   sizeof(int),
+                                   cudaMemcpyDeviceToHost),
+                        "cudaMemcpy(integrated_count to host)")) {
             result = integrators::IntegratorResult::BAD_INPUTS;
             break;
         }
@@ -7763,9 +7902,10 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                       << " with code " << host_failure << "\n";
             break;
         }
-        if (host_all_stopped != 0) {
+        if (host_integrated_count == 0) {
             break;
         }
+        grid_time = next_grid_time;
         completed_global_steps += 1;
     }
 
@@ -7776,7 +7916,8 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
     }
 
     cudaFree(device_cells);
-    cudaFree(device_all_stopped);
+    cudaFree(device_dt_candidates);
+    cudaFree(device_integrated_count);
     cudaFree(device_failure);
     return result;
 }
@@ -8470,6 +8611,11 @@ int main(int argc, char** argv) {
     std::cout << "Primordial chemistry collapse grid with ROS2S\n";
     std::cout << "grid: " << options.grid_dim << "^3 (" << num_cells << " cells)\n";
     std::cout << "perturbations: " << (options.perturb ? "enabled" : "disabled") << "\n";
+#if defined(PRIMORDIAL_ROS2S_ENABLE_CUDA) || defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
+    std::cout << "driver policy: gridwide-independent\n";
+#else
+    std::cout << "driver policy: legacy-local\n";
+#endif
     std::cout << "completed global collapse steps: " << completed_global_steps << "\n";
     print_collapse_summary(cells, representative);
     std::cout << "wall time: " << elapsed << " s\n";
