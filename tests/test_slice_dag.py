@@ -88,7 +88,13 @@ class SliceDagGenerationTests(unittest.TestCase):
                 ROOT / "reproducer.mojo", Path(second)
             )
             self.assertEqual(report_a, report_b)
-            for name in ("slices_jac.mojo", "slices_rhs.mojo", "slice_report.json"):
+            for name in (
+                "slices_jac.mojo",
+                "slices_rhs.mojo",
+                "slices_jac_shared.mojo",
+                "slices_rhs_shared.mojo",
+                "slice_report.json",
+            ):
                 self.assertEqual(
                     (Path(first) / name).read_bytes(),
                     (Path(second) / name).read_bytes(),
@@ -100,6 +106,26 @@ class SliceDagGenerationTests(unittest.TestCase):
             )
             parsed = json.loads((Path(first) / "slice_report.json").read_text())
             self.assertEqual(parsed["functions"]["jac_nuc"]["outputs"], 225)
+            self.assertEqual(
+                parsed["shared_scratch"]["jacobian"]["scratch_slots"], 457
+            )
+            self.assertEqual(
+                parsed["shared_scratch"]["rhs"]["scratch_slots"], 154
+            )
+
+    def test_bounded_regions_reduce_shared_scratch(self):
+        with tempfile.TemporaryDirectory() as output:
+            report = slice_dag.generate(
+                ROOT / "reproducer.mojo",
+                Path(output),
+                shared_region_definitions=48,
+            )
+            self.assertEqual(
+                report["shared_scratch"]["jacobian"]["scratch_slots"], 363
+            )
+            self.assertEqual(
+                report["shared_scratch"]["rhs"]["scratch_slots"], 101
+            )
 
     def test_exchange_budget_is_enforced(self):
         with tempfile.TemporaryDirectory() as output:
