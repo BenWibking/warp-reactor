@@ -7474,7 +7474,9 @@ struct Options {
 using Ros2sIntegrator = integrators::RODAS<pc::PrimordialChem>;
 
 constexpr const char* backend_name() {
-#if defined(PRIMORDIAL_ROS2S_ENABLE_CUDA)
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    return "cuda-structured";
+#elif defined(PRIMORDIAL_ROS2S_ENABLE_CUDA)
     return "cuda";
 #elif defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
     return "hip";
@@ -7782,6 +7784,10 @@ __global__ void advance_collapse_gridwide_kernel(
     }
 }
 
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+#include "structured_cuda.cuh"
+#endif
+
 integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                                              bool perturb,
                                              int& completed_global_steps) {
@@ -7820,6 +7826,19 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                   "PRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK cannot exceed 1024");
     const int num_cells = static_cast<int>(cells.size());
     const int grid_size = (num_cells + block_size - 1) / block_size;
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    const int structured_grid_size =
+        (num_cells + structured_cuda::kTileCells - 1) /
+        structured_cuda::kTileCells;
+    if (!check_cuda(
+            cudaFuncSetAttribute(
+                structured_cuda::advance_collapse_gridwide_structured_kernel,
+                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                static_cast<int>(structured_cuda::kSharedBytes)),
+            "cudaFuncSetAttribute(structured shared memory)")) {
+        result = integrators::IntegratorResult::BAD_INPUTS;
+    }
+#endif
     std::vector<integrators::Real> dt_candidates(cells.size());
     integrators::Real grid_time = 0.0;
 
@@ -7874,12 +7893,28 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
             result = integrators::IntegratorResult::BAD_INPUTS;
             break;
         }
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+        structured_cuda::advance_collapse_gridwide_structured_kernel
+            <<<structured_grid_size, structured_cuda::kBlockThreads,
+               structured_cuda::kSharedBytes>>>(
+                device_cells, num_cells, completed_global_steps, grid_time,
+                next_grid_time, dt_grid, device_integrated_count,
+                device_failure);
+        constexpr const char* advance_launch =
+            "advance_collapse_gridwide_structured_kernel launch";
+        constexpr const char* advance_sync =
+            "advance_collapse_gridwide_structured_kernel synchronize";
+#else
         advance_collapse_gridwide_kernel<<<grid_size, block_size>>>(
             device_cells, num_cells, completed_global_steps, next_grid_time,
             dt_grid, device_integrated_count, device_failure);
-        if (!check_cuda(cudaGetLastError(), "advance_collapse_gridwide_kernel launch") ||
-            !check_cuda(cudaDeviceSynchronize(),
-                        "advance_collapse_gridwide_kernel synchronize")) {
+        constexpr const char* advance_launch =
+            "advance_collapse_gridwide_kernel launch";
+        constexpr const char* advance_sync =
+            "advance_collapse_gridwide_kernel synchronize";
+#endif
+        if (!check_cuda(cudaGetLastError(), advance_launch) ||
+            !check_cuda(cudaDeviceSynchronize(), advance_sync)) {
             result = integrators::IntegratorResult::BAD_INPUTS;
             break;
         }
@@ -8611,7 +8646,9 @@ int main(int argc, char** argv) {
     std::cout << "Primordial chemistry collapse grid with ROS2S\n";
     std::cout << "grid: " << options.grid_dim << "^3 (" << num_cells << " cells)\n";
     std::cout << "perturbations: " << (options.perturb ? "enabled" : "disabled") << "\n";
-#if defined(PRIMORDIAL_ROS2S_ENABLE_CUDA) || defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    std::cout << "driver policy: gridwide-structured-cta32\n";
+#elif defined(PRIMORDIAL_ROS2S_ENABLE_CUDA) || defined(PRIMORDIAL_ROS2S_ENABLE_HIP)
     std::cout << "driver policy: gridwide-independent\n";
 #else
     std::cout << "driver policy: legacy-local\n";

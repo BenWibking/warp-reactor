@@ -947,9 +947,6 @@ def structured_chemistry_kernel[
     var work = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.BatchCells, reproducer.Neqs]())
-    var pivots = stack_allocation[
-        DType.int32, address_space=AddressSpace.SHARED
-    ](row_major[structured_ops.TileCells, reproducer.Neqs]())
     var infos = stack_allocation[
         DType.int32, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells]())
@@ -965,15 +962,16 @@ def structured_chemistry_kernel[
     var control_f64 = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[3]())
+    # Threads 0..31 each retain one cell's LU factors and pivots across the
+    # three ROS2S solves. Other threads continue to execute the cooperative
+    # chemistry DAG but do not use these thread-local values.
+    var thread_lu = reproducer.MatTensor.stack_allocation()
+    var thread_rhs = reproducer.VecTensor.stack_allocation()
+    var thread_pivots = InlineArray[Int, reproducer.Neqs](fill=0)
 
     var tid = thread_idx.x
     var physical_warp = tid // WARP_SIZE
     var physical_lane = tid % WARP_SIZE
-    var warp_id = (
-        physical_warp * structured_ops.LuGroupsPerWarp
-        + physical_lane // structured_ops.LuGroupWidth
-    )
-    var lane = physical_lane % structured_ops.LuGroupWidth
     var tile_begin = block_idx.x * structured_ops.TileCells
     var active_cells = min(structured_ops.TileCells, num_cells - tile_begin)
     if tid < structured_ops.TileCells:
@@ -1088,46 +1086,51 @@ def structured_chemistry_kernel[
             physical_lane,
             active_cells,
         )
-        var tile_cell = warp_id
+        var tile_cell = tid
         var participating = False
         if tile_cell < active_cells:
             participating = rebind[Scalar[DType.int32]](
                 participants[tile_cell]
             ) > 0
         comptime matrix_values = reproducer.Neqs * reproducer.Neqs
+        var lu_info = 0
         if participating:
-            for column in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
-                for row in range(reproducer.Neqs):
+            for row in range(reproducer.Neqs):
+                for column in range(reproducer.Neqs):
                     var index = (
                         tile_cell * matrix_values
                         + row * reproducer.Neqs
                         + column
                     )
-                    jacobian[index] = -jacobian[index]
+                    var value = -jacobian[index]
                     if row == column:
-                        jacobian[index] += 1.0 / (h * gamma)
-        barrier()
-        factorize_shared(
-            jacobian, participating, tile_cell, lane, pivots, infos
-        )
+                        value += 1.0 / (h * gamma)
+                    reproducer.mset(thread_lu, row, column, value)
+            lu_info = reproducer.lu_decomposition(
+                thread_lu, thread_pivots
+            )
+        if tile_cell < active_cells:
+            infos[tile_cell] = Int32(lu_info)
         barrier()
         if tid == 0:
             for owner in range(active_cells):
                 if rebind[Scalar[DType.int32]](infos[owner]) != 0:
                     control_i32[1] = Int32(1)
         barrier()
-        solve_shared(
-            jacobian, rhs, participating, tile_cell, lane, pivots, infos
-        )
-        if participating:
-            for component in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
-                var solution = rebind[Scalar[DType.float64]](
-                    rhs[tile_cell * reproducer.Neqs + component]
+        var nonsingular = participating and lu_info == 0
+        if nonsingular:
+            for component in range(reproducer.Neqs):
+                reproducer.vset(
+                    thread_rhs,
+                    component,
+                    rebind[Scalar[DType.float64]](
+                        rhs[tile_cell * reproducer.Neqs + component]
+                    ),
                 )
+            reproducer.lu_solve(thread_lu, thread_pivots, thread_rhs)
+            for component in range(reproducer.Neqs):
+                var solution = reproducer.vget(thread_rhs, component)
+                rhs[tile_cell * reproducer.Neqs + component] = solution
                 k1[tile_cell, component] = solution
                 stage_y[tile_cell, component] = (
                     rebind[Scalar[DType.float64]](
@@ -1148,27 +1151,22 @@ def structured_chemistry_kernel[
             physical_lane,
             active_cells,
         )
-        if participating:
-            for component in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
-                rhs[tile_cell * reproducer.Neqs + component] = (
-                    rhs[tile_cell * reproducer.Neqs + component]
+        if nonsingular:
+            for component in range(reproducer.Neqs):
+                reproducer.vset(
+                    thread_rhs,
+                    component,
+                    rebind[Scalar[DType.float64]](
+                        rhs[tile_cell * reproducer.Neqs + component]
+                    )
                     + rebind[Scalar[DType.float64]](
                         k2[tile_cell, component]
-                    )
+                    ),
                 )
-        barrier()
-        solve_shared(
-            jacobian, rhs, participating, tile_cell, lane, pivots, infos
-        )
-        if participating:
-            for component in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
-                var solution = rebind[Scalar[DType.float64]](
-                    rhs[tile_cell * reproducer.Neqs + component]
-                )
+            reproducer.lu_solve(thread_lu, thread_pivots, thread_rhs)
+            for component in range(reproducer.Neqs):
+                var solution = reproducer.vget(thread_rhs, component)
+                rhs[tile_cell * reproducer.Neqs + component] = solution
                 k2[tile_cell, component] = solution
                 stage_y[tile_cell, component] = (
                     rebind[Scalar[DType.float64]](
@@ -1203,33 +1201,28 @@ def structured_chemistry_kernel[
             physical_lane,
             active_cells,
         )
-        if participating:
-            for component in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
-                rhs[tile_cell * reproducer.Neqs + component] = (
-                    rhs[tile_cell * reproducer.Neqs + component]
+        if nonsingular:
+            for component in range(reproducer.Neqs):
+                reproducer.vset(
+                    thread_rhs,
+                    component,
+                    rebind[Scalar[DType.float64]](
+                        rhs[tile_cell * reproducer.Neqs + component]
+                    )
                     + rebind[Scalar[DType.float64]](
                         work[tile_cell, component]
-                    )
+                    ),
                 )
-        barrier()
-        solve_shared(
-            jacobian, rhs, participating, tile_cell, lane, pivots, infos
-        )
-        if participating:
-            for component in range(
-                lane, reproducer.Neqs, structured_ops.LuGroupWidth
-            ):
+            reproducer.lu_solve(thread_lu, thread_pivots, thread_rhs)
+            for component in range(reproducer.Neqs):
                 var first = rebind[Scalar[DType.float64]](
                     k1[tile_cell, component]
                 )
                 var second = rebind[Scalar[DType.float64]](
                     k2[tile_cell, component]
                 )
-                var third = rebind[Scalar[DType.float64]](
-                    rhs[tile_cell * reproducer.Neqs + component]
-                )
+                var third = reproducer.vget(thread_rhs, component)
+                rhs[tile_cell * reproducer.Neqs + component] = third
                 candidate_stage[tile_cell, component] = (
                     rebind[Scalar[DType.float64]](
                         base[tile_cell, component]
@@ -1244,7 +1237,7 @@ def structured_chemistry_kernel[
                     + reproducer.portable_mul(e3, third)
                 )
         barrier()
-        if participating and lane == 0:
+        if nonsingular:
             var sum_squared = 0.0
             for component in range(reproducer.Neqs):
                 var old_value = rebind[Scalar[DType.float64]](

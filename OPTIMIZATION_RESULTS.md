@@ -13,9 +13,11 @@ controller, not the timing of the Mojo structured kernel.
 
 The scratch/occupancy redesign was rejected by resource feasibility analysis,
 and an implemented independent per-cell controller was reverted after it
-regressed the retained fused kernel by 1.13%. Jacobian caching, approximate
-temperature rates, and explicit FMA experiments were not retained for the
-evidence-based reasons below.
+regressed the retained fused kernel by 1.13%. Jacobian caching was not
+implemented during this pass; subsequent static analysis found that the
+reported rejection counter omits startup rejections, so caching remains a
+credible follow-up rather than a closed path. Approximate temperature rates
+and explicit FMA experiments were not retained for the reasons below.
 
 ## Measurement Environment
 
@@ -145,15 +147,25 @@ species relative difference; the existing cross-implementation comparator
 tolerances were exceeded. This was recorded but was not the reason for the
 performance rejection.
 
-## 4. Rejected-Step Jacobian Cache: Skipped After Instrumentation
+## 4. Rejected-Step Jacobian Cache: Not Implemented; Reconsider
 
-The retained fused grid-64 rejection distribution is 0 / 0 / 295 against an
-internal-step distribution of 1,616 / 1,687 / 9,262. Thus at least half the
-cells report no counted rejection, and even the maximum is about 3.2% of
-internal attempts. A roughly 472 MiB global Jacobian cache would add an
-unfactored-Jacobian store to every accepted base state to save work only on
-the rare rejected attempts. That does not amortize for this workload, so the
-conditional plan correctly skips implementation.
+The retained fused grid-64 *counted* rejection distribution is 0 / 0 / 295
+against an internal-step distribution of 1,616 / 1,687 / 9,262. That counter
+only increments after the first accepted inner step, so it omits startup
+rejections and is not a valid cache-frequency proxy by itself.
+
+The saved CUDA counters expose the omission: CUDA reports internal/Jacobian
+counts of 1,365/1,217, 1,543/1,321, and 8,799/6,553. Its source evaluates the
+raw Jacobian outside the retry loop and reconstructs/refactors the shifted
+matrix after a rejection. Mojo reports identical internal/Jacobian counts
+because it regenerates the fused base DAG on every attempt. Thus CUDA reuses
+the Jacobian on about 14% of median attempts and 26% of maximum attempts.
+
+No cache implementation or timing was performed in this optimization pass.
+The earlier skip decision was based on incomplete instrumentation and should
+not be treated as evidence that a cache cannot amortize. A future design would
+need to balance the saved 225-output Jacobian DAG against the storage/reload
+cost without assuming that the counted rejection statistic is complete.
 
 ## 5. Temperature-Rate Work
 

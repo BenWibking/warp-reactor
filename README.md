@@ -36,6 +36,20 @@ CUDA build with the default project settings:
 nvcc -x cu -std=c++20 -O3 -arch=sm_90 --expt-relaxed-constexpr --fmad=false --maxrregcount=255 -DPRIMORDIAL_ROS2S_ENABLE_CUDA -DPRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK=128 -I. reproducer.cpp -o reproducer_cuda
 ```
 
+Pure-CUDA port of the Hopper structured kernel:
+
+```bash
+python3 tools/slice_dag.py
+nvcc -x cu -std=c++20 -O3 -arch=sm_90 --expt-relaxed-constexpr --fmad=false --maxrregcount=255 -DPRIMORDIAL_ROS2S_ENABLE_CUDA -DPRIMORDIAL_ROS2S_CUDA_STRUCTURED -DPRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK=128 -I. reproducer.cpp -o reproducer_cuda_structured
+```
+
+This variant preserves the Mojo structured kernel's 32-cell, 256-thread CTA,
+two-wave chemistry DAG, shared-memory staging, four 8-lane LU groups per
+warp, and tile-wide adaptive controller. It uses 230,576 bytes of dynamic
+shared memory and therefore targets Hopper-class GPUs with the 227 KiB
+opt-in shared-memory configuration. Output identifies the policy as
+`gridwide-structured-cta32`.
+
 HIP build with the default project settings:
 
 ```bash

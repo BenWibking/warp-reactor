@@ -94,6 +94,8 @@ class SliceDagGenerationTests(unittest.TestCase):
                 "slices_jac_shared.mojo",
                 "slices_rhs_shared.mojo",
                 "slices_base_shared.mojo",
+                "slices_rhs_shared.cuh",
+                "slices_base_shared.cuh",
                 "slice_report.json",
             ):
                 self.assertEqual(
@@ -142,6 +144,17 @@ class SliceDagGenerationTests(unittest.TestCase):
                 "def base_exchange_shared(",
                 (Path(first) / "slices_base_shared.mojo").read_text(),
             )
+            cuda_base = (Path(first) / "slices_base_shared.cuh").read_text()
+            cuda_rhs = (Path(first) / "slices_rhs_shared.cuh").read_text()
+            self.assertIn("namespace structured_cuda_base", cuda_base)
+            self.assertIn("base_exchange_shared", cuda_base)
+            self.assertIn("structured_mul", cuda_base)
+            self.assertIn("namespace structured_cuda_rhs", cuda_rhs)
+            self.assertIn("rhs_specie_exchange_shared", cuda_rhs)
+            self.assertNotIn(" if ", cuda_base)
+            for cuda_source in (cuda_base, cuda_rhs):
+                self.assertNotIn("cell * ScratchSlots", cuda_source)
+                self.assertNotIn("cell * ExchangeSlots", cuda_source)
             self.assertEqual(
                 parsed["shared_scratch"]["jacobian"]["wave_warps"],
                 [[7, 1, 0], [2, 3, 4, 5, 6]],
@@ -192,6 +205,17 @@ class StrictMultiplyRewriteTests(unittest.TestCase):
     def test_non_products_are_unchanged(self):
         rewritten = rewrite_strict_mul.rewrite_expression("a / b + c - d")
         self.assertEqual(rewritten, "(((a / b) + c) - d)")
+
+
+class CudaExpressionTests(unittest.TestCase):
+    def test_nested_conditionals_and_boolean_operators(self):
+        translated = slice_dag.cuda_expression(
+            "portable_mul(a, b) if truthy(x and not y) else portable_sqrt(z)"
+        )
+        self.assertEqual(
+            translated,
+            "(structured_truthy((x && (!y))) ? structured_mul(a, b) : structured_sqrt(z))",
+        )
 
 
 if __name__ == "__main__":
