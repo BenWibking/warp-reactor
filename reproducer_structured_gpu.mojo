@@ -97,6 +97,7 @@ def main() raises:
     var completed_global_steps = 0
     var grid_time = 0.0
     var failed = reproducer.Success
+    var limiting_cell = -1
     var start = perf_counter_ns()
     for step in range(reproducer.MaxCollapseSteps):
         failure_buffer.enqueue_fill(Int32(reproducer.Success))
@@ -117,7 +118,7 @@ def main() raises:
         )
         ctx.synchronize()
         var dt_grid = Float64.MAX
-        var limiting_cell = Int.MAX
+        limiting_cell = Int.MAX
         with min_buffer.map_to_host() as mapped_minima:
             var host_minima = TileTensor(mapped_minima, tile_layout)
             with id_buffer.map_to_host() as mapped_ids:
@@ -217,9 +218,61 @@ def main() raises:
     print("Primordial chemistry collapse grid with ROS2S")
     print("backend: mojo-gpu-structured-hopper")
     print("grid:", options.grid_dim, "^3 (", num_cells, "cells )")
+    print("perturbations:", "enabled" if options.perturb else "disabled")
     print("driver policy: gridwide-cta32")
     print("completed global collapse steps:", completed_global_steps)
+    print("limiting cell:", limiting_cell)
+    if num_cells == 1:
+        print("representative cell completed steps:", cells[0].completed_steps)
+        print("representative cell physical time:", cells[0].time)
+        print("representative cell density driver:", cells[0].density_driver)
+    else:
+        reproducer.print_summary(
+            "cell completed steps", reproducer.summarize_cells(cells, 0)
+        )
+        reproducer.print_summary(
+            "cell physical time", reproducer.summarize_cells(cells, 1)
+        )
+        reproducer.print_summary(
+            "cell density driver", reproducer.summarize_cells(cells, 2)
+        )
     print("wall time:", elapsed, "s")
+    if num_cells == 1:
+        var total_stats = reproducer.IntegratorStats()
+        reproducer.add_stats(total_stats, cells[0].stats)
+        print("ROS2S internal steps:", total_stats.internal_steps)
+        print("ROS2S rhs calls:", total_stats.rhs_calls)
+        print("ROS2S jacobian calls:", total_stats.jacobian_calls)
+        print("ROS2S decompositions:", total_stats.decompositions)
+        print("ROS2S linear solves:", total_stats.linear_solves)
+        print(
+            "ROS2S accepted/rejected:",
+            total_stats.accepted_steps,
+            "/",
+            total_stats.rejected_steps,
+        )
+    else:
+        reproducer.print_summary(
+            "ROS2S internal steps", reproducer.summarize_cells(cells, 3)
+        )
+        reproducer.print_summary(
+            "ROS2S rhs calls", reproducer.summarize_cells(cells, 4)
+        )
+        reproducer.print_summary(
+            "ROS2S jacobian calls", reproducer.summarize_cells(cells, 5)
+        )
+        reproducer.print_summary(
+            "ROS2S decompositions", reproducer.summarize_cells(cells, 6)
+        )
+        reproducer.print_summary(
+            "ROS2S linear solves", reproducer.summarize_cells(cells, 7)
+        )
+        reproducer.print_summary(
+            "ROS2S accepted steps", reproducer.summarize_cells(cells, 8)
+        )
+        reproducer.print_summary(
+            "ROS2S rejected steps", reproducer.summarize_cells(cells, 9)
+        )
     if options.compare_final_state_path != "":
         if not reproducer.compare_final_states_from_file(
             cells,
@@ -235,3 +288,5 @@ def main() raises:
             options.write_final_state_path,
             reproducer.GridwideCta32Policy,
         )
+    if options.grid_dim == 1:
+        reproducer.print_state(cells[0].current)

@@ -12,5 +12,7 @@ reproducer_hip
 __pycache__/
 *.pyc
 
-# comparator diagnostics
-final_state_comparison_failures_mojo.csv
+# comparator diagnostics and local benchmark artifacts
+final_state_comparison_failures_*.csv
+final_states_grid*.bin*
+benchmark_runs/

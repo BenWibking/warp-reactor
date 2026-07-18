@@ -23,17 +23,6 @@ from generated.slices_rhs import (
     rhs_specie_slice_6,
     rhs_specie_slice_7,
 )
-from generated.slices_jac_shared import (
-    ScratchSlots as JacScratchSlots,
-    jac_nuc_slice_0_shared,
-    jac_nuc_slice_1_shared,
-    jac_nuc_slice_2_shared,
-    jac_nuc_slice_3_shared,
-    jac_nuc_slice_4_shared,
-    jac_nuc_slice_5_shared,
-    jac_nuc_slice_6_shared,
-    jac_nuc_slice_7_shared,
-)
 from generated.slices_rhs_shared import (
     ExchangeSlots as RhsExchangeSlots,
     ScratchSlots as RhsScratchSlots,
@@ -47,6 +36,19 @@ from generated.slices_rhs_shared import (
     rhs_specie_slice_5_shared,
     rhs_specie_slice_6_shared,
     rhs_specie_slice_7_shared,
+)
+from generated.slices_base_shared import (
+    ExchangeSlots as BaseExchangeSlots,
+    ScratchSlots as BaseScratchSlots,
+    base_exchange_shared,
+    base_slice_0_shared,
+    base_slice_1_shared,
+    base_slice_2_shared,
+    base_slice_3_shared,
+    base_slice_4_shared,
+    base_slice_5_shared,
+    base_slice_6_shared,
+    base_slice_7_shared,
 )
 from layout import TensorLayout, TileTensor
 from std.gpu import WARP_SIZE, barrier, block_idx, thread_idx
@@ -67,7 +69,9 @@ comptime BatchesPerTile = 1
 comptime BlockThreads = OwnerWarps * WARP_SIZE
 comptime DynamicJBytes = TileCells * reproducer.Neqs * reproducer.Neqs * 8
 comptime DagScratchSlots = (
-    JacScratchSlots if JacScratchSlots >= RhsScratchSlots else RhsScratchSlots
+    BaseScratchSlots
+    if BaseScratchSlots >= RhsScratchSlots
+    else RhsScratchSlots
 )
 comptime DagInputValues = TileCells * reproducer.Neqs
 comptime DagScratchValues = TileCells * DagScratchSlots
@@ -76,13 +80,18 @@ comptime DynamicJValues = TileCells * reproducer.Neqs * reproducer.Neqs
 comptime DagScratchOffset = DynamicJValues
 comptime RhsOffset = DagScratchOffset + DagScratchValues
 comptime DagInputOffset = RhsOffset + RhsValues
-comptime RhsExchangeValues = TileCells * RhsExchangeSlots
-comptime RhsExchangeOffset = DagInputOffset + DagInputValues
-comptime DynamicSharedValues = RhsExchangeOffset + RhsExchangeValues
+comptime DagExchangeSlots = (
+    BaseExchangeSlots
+    if BaseExchangeSlots >= RhsExchangeSlots
+    else RhsExchangeSlots
+)
+comptime DagExchangeValues = TileCells * DagExchangeSlots
+comptime DagExchangeOffset = DagInputOffset + DagInputValues
+comptime DynamicSharedValues = DagExchangeOffset + DagExchangeValues
 comptime DynamicSharedBytes = DynamicSharedValues * 8
 comptime HopperSharedBytes = 227 * 1024
 comptime MaxExchangeBytes = 8 * 1024
-comptime GeneratedExchangeBytes = RhsExchangeValues * 8
+comptime GeneratedExchangeBytes = DagExchangeValues * 8
 
 
 def align_up(value: Int, alignment: Int) -> Int:
@@ -150,7 +159,8 @@ def validate_config():
     comptime assert LuGroupWidth * LuGroupsPerWarp == WARP_SIZE
     comptime assert reproducer.Neqs <= 2 * LuGroupWidth
     comptime assert BlockThreads == 256
-    comptime assert DagScratchSlots == JacScratchSlots
+    comptime assert DagScratchSlots == BaseScratchSlots
+    comptime assert DagExchangeSlots == BaseExchangeSlots
     comptime assert GeneratedExchangeBytes <= MaxExchangeBytes
     comptime assert SmemLayout.Bytes <= HopperSharedBytes
 
@@ -213,32 +223,6 @@ comptime SharedPointer = UnsafePointer[
 ]
 
 
-def dispatch_jac_slice_shared(
-    warp_id: Int,
-    inputs: SharedPointer,
-    outputs: SharedPointer,
-    scratch: SharedPointer,
-    cell: Int,
-    z: Float64,
-):
-    if warp_id == 0:
-        jac_nuc_slice_0_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 1:
-        jac_nuc_slice_1_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 2:
-        jac_nuc_slice_2_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 3:
-        jac_nuc_slice_3_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 4:
-        jac_nuc_slice_4_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 5:
-        jac_nuc_slice_5_shared(inputs, outputs, scratch, cell, z)
-    elif warp_id == 6:
-        jac_nuc_slice_6_shared(inputs, outputs, scratch, cell, z)
-    else:
-        jac_nuc_slice_7_shared(inputs, outputs, scratch, cell, z)
-
-
 def first_wave_logical_warp(physical_warp: Int) -> Int:
     if physical_warp == 0:
         return 7
@@ -295,6 +279,60 @@ def produce_rhs_exchange_shared(
     z: Float64,
 ):
     rhs_specie_exchange_shared(inputs, exchange, scratch, cell, z)
+
+
+def dispatch_base_slice_shared(
+    warp_id: Int,
+    inputs: SharedPointer,
+    jacobian: SharedPointer,
+    rhs: SharedPointer,
+    exchange: SharedPointer,
+    scratch: SharedPointer,
+    cell: Int,
+    z: Float64,
+):
+    if warp_id == 0:
+        base_slice_0_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 1:
+        base_slice_1_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 2:
+        base_slice_2_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 3:
+        base_slice_3_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 4:
+        base_slice_4_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 5:
+        base_slice_5_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    elif warp_id == 6:
+        base_slice_6_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+    else:
+        base_slice_7_shared(
+            inputs, jacobian, rhs, exchange, scratch, cell, z
+        )
+
+
+def produce_base_exchange_shared(
+    inputs: SharedPointer,
+    exchange: SharedPointer,
+    scratch: SharedPointer,
+    cell: Int,
+    z: Float64,
+):
+    base_exchange_shared(inputs, exchange, scratch, cell, z)
 
 
 def dag_slice_kernel[

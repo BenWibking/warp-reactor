@@ -52,6 +52,7 @@ class Output:
     key: tuple[int, ...]
     statement: Statement
     dependencies: tuple[str, ...]
+    kind: str = ""
 
 
 @dataclasses.dataclass
@@ -141,9 +142,14 @@ def _parse_output(function: str, statement: Statement) -> Output | None:
         match = re.match(r"vset\(ydot,\s*(\d+)\s*,", text)
         if not match:
             raise DagError(f"line {statement.line}: malformed ydot output")
-        return Output((int(match.group(1)),), statement, _dependencies(text))
+        return Output(
+            (int(match.group(1)),),
+            statement,
+            _dependencies(text),
+            function,
+        )
     if function == "rhs_eint" and text.startswith("return "):
-        return Output((14,), statement, _dependencies(text))
+        return Output((14,), statement, _dependencies(text), function)
     if function == "jac_nuc" and text.startswith("mset(jac,"):
         match = re.match(r"mset\(jac,\s*(\d+)\s*,\s*(\d+)\s*,", text)
         if not match:
@@ -152,6 +158,7 @@ def _parse_output(function: str, statement: Statement) -> Output | None:
             (int(match.group(1)), int(match.group(2))),
             statement,
             _dependencies(text),
+            function,
         )
     return None
 
@@ -223,10 +230,63 @@ def transitive_closure(dag: FunctionDag, output: Output) -> set[str]:
     return closure
 
 
+def merge_base_dags(dags: Iterable[FunctionDag]) -> FunctionDag:
+    """Merge Jacobian and RHS DAGs with deterministic structural CSE."""
+    definitions: list[Definition] = []
+    outputs: list[Output] = []
+    expression_names: dict[str, str] = {}
+
+    for dag in dags:
+        local_names: dict[str, str] = {}
+        for definition in dag.definitions:
+            text = definition.statement.text.strip()
+            match = DEF_RE.match(text)
+            if match is None:
+                raise DagError(
+                    f"line {definition.statement.line}: malformed base definition"
+                )
+            expression = TEMP_RE.sub(
+                lambda token: local_names[token.group(0)],
+                text[match.end() :].strip(),
+            )
+            expression_key = re.sub(r"\s+", " ", expression).strip()
+            name = expression_names.get(expression_key)
+            if name is None:
+                name = f"x99_{len(definitions)}"
+                expression_names[expression_key] = name
+                definitions.append(
+                    Definition(
+                        name,
+                        Statement(
+                            f"var {name} = {expression}",
+                            definition.statement.line,
+                        ),
+                        _dependencies(expression),
+                    )
+                )
+            local_names[definition.name] = name
+
+        for output in dag.outputs:
+            statement = TEMP_RE.sub(
+                lambda token: local_names[token.group(0)],
+                output.statement.text,
+            )
+            outputs.append(
+                Output(
+                    output.key,
+                    Statement(statement, output.statement.line),
+                    _dependencies(statement),
+                    output.kind or dag.name,
+                )
+            )
+
+    return FunctionDag("base", (), tuple(definitions), tuple(outputs))
+
+
 def assign_outputs(dag: FunctionDag, warps: int) -> list[list[Output]]:
     assigned: list[list[Output]] = [[] for _ in range(warps)]
     for output in dag.outputs:
-        if dag.name == "jac_nuc":
+        if dag.name == "jac_nuc" or output.kind == "jac_nuc":
             warp = min(warps - 1, output.key[0] * warps // 15)
         else:
             warp = output.key[0] % warps
@@ -420,7 +480,10 @@ def _emit_shared_output(
         scratch_offset,
         exchange_slots,
     )
-    if dag.name == "jac_nuc":
+    kind = output.kind or dag.name
+    jacobian = "jacobian" if dag.name == "base" else "outputs"
+    rhs = "rhs" if dag.name == "base" else "outputs"
+    if kind == "jac_nuc":
         match = re.match(
             r"mset\(jac,\s*(\d+)\s*,\s*(\d+)\s*,\s*(.*)\)\s*$",
             text,
@@ -430,10 +493,10 @@ def _emit_shared_output(
             raise DagError(f"line {output.statement.line}: malformed shared J output")
         row, column, expression = match.groups()
         return (
-            f"outputs[cell * 225 + {row} * 15 + {column}] = "
+            f"{jacobian}[cell * 225 + {row} * 15 + {column}] = "
             f"{expression}"
         )
-    if dag.name == "rhs_specie":
+    if kind == "rhs_specie":
         match = re.match(
             r"vset\(ydot,\s*(\d+)\s*,\s*(.*)\)\s*$",
             text,
@@ -442,10 +505,10 @@ def _emit_shared_output(
         if match is None:
             raise DagError(f"line {output.statement.line}: malformed shared RHS output")
         component, expression = match.groups()
-        return f"outputs[cell * 15 + {component}] = {expression}"
+        return f"{rhs}[cell * 15 + {component}] = {expression}"
     if not text.startswith("return "):
         raise DagError(f"line {output.statement.line}: malformed shared energy output")
-    return f"outputs[cell * 15 + 14] = {text[len('return '):]}"
+    return f"{rhs}[cell * 15 + 14] = {text[len('return '):]}"
 
 
 @dataclasses.dataclass
@@ -724,7 +787,10 @@ def emit_shared_function(
 
     def emit_region_output(output: Output, local_names: set[str]) -> str:
         text = replace_region_operands(output.statement.text.strip(), local_names)
-        if dag.name == "jac_nuc":
+        kind = output.kind or dag.name
+        jacobian = "jacobian" if dag.name == "base" else "outputs"
+        rhs = "rhs" if dag.name == "base" else "outputs"
+        if kind == "jac_nuc":
             match = re.match(
                 r"mset\(jac,\s*(\d+)\s*,\s*(\d+)\s*,\s*(.*)\)\s*$",
                 text,
@@ -736,10 +802,10 @@ def emit_shared_function(
                 )
             row, column, expression = match.groups()
             return (
-                f"outputs[cell * 225 + {row} * 15 + {column}] = "
+                f"{jacobian}[cell * 225 + {row} * 15 + {column}] = "
                 f"{expression}"
             )
-        if dag.name == "rhs_specie":
+        if kind == "rhs_specie":
             match = re.match(
                 r"vset\(ydot,\s*(\d+)\s*,\s*(.*)\)\s*$",
                 text,
@@ -750,19 +816,24 @@ def emit_shared_function(
                     f"line {output.statement.line}: malformed shared RHS output"
                 )
             component, expression = match.groups()
-            return f"outputs[cell * 15 + {component}] = {expression}"
+            return f"{rhs}[cell * 15 + {component}] = {expression}"
         if not text.startswith("return "):
             raise DagError(
                 f"line {output.statement.line}: malformed shared energy output"
             )
-        return f"outputs[cell * 15 + 14] = {text[len('return '):]}"
+        return f"{rhs}[cell * 15 + 14] = {text[len('return '):]}"
 
     functions: list[str] = []
     for region_index, (start, end) in enumerate(schedule.regions):
         helper_name = f"_{dag.name}_slice_{warp}_region_{region_index}"
+        output_arguments = (
+            "jacobian: SharedPointer, rhs: SharedPointer, "
+            if dag.name == "base"
+            else "outputs: SharedPointer, "
+        )
         lines = [
             "@no_inline",
-            f"def {helper_name}(inputs: SharedPointer, outputs: SharedPointer, ",
+            f"def {helper_name}(inputs: SharedPointer, {output_arguments}",
         ]
         if exchange_slots:
             lines.append(
@@ -829,7 +900,11 @@ def emit_shared_function(
         functions.append("\n".join(lines))
 
     signature = f"def {dag.name}_slice_{warp}_shared("
-    signature += "inputs: SharedPointer, outputs: SharedPointer, "
+    signature += "inputs: SharedPointer, "
+    if dag.name == "base":
+        signature += "jacobian: SharedPointer, rhs: SharedPointer, "
+    else:
+        signature += "outputs: SharedPointer, "
     if exchange_slots:
         signature += "exchange: SharedPointer, "
     signature += "scratch: SharedPointer, cell: Int, z: Float64):"
@@ -840,8 +915,9 @@ def emit_shared_function(
     for region_index in range(len(schedule.regions)):
         call = (
             f"    _{dag.name}_slice_{warp}_region_{region_index}("
-            "inputs, outputs, "
+            "inputs, "
         )
+        call += "jacobian, rhs, " if dag.name == "base" else "outputs, "
         if exchange_slots:
             call += "exchange, "
         wrapper.append(call + "scratch, cell, z)")
@@ -863,7 +939,11 @@ def emit_lifetime_shared_function(
     schedule = make_shared_schedule(dag, closure, outputs)
     boolean_names: set[str] = set()
     signature = f"def {dag.name}_slice_{warp}_shared("
-    signature += "inputs: SharedPointer, outputs: SharedPointer, "
+    signature += "inputs: SharedPointer, "
+    if dag.name == "base":
+        signature += "jacobian: SharedPointer, rhs: SharedPointer, "
+    else:
+        signature += "outputs: SharedPointer, "
     if exchange_slots:
         signature += "exchange: SharedPointer, "
     signature += "scratch: SharedPointer, cell: Int, z: Float64):"
@@ -1204,10 +1284,20 @@ def generate(
         name: partition(dag, warps, threshold, batch_cells)
         for name, dag in dags.items()
     }
+    base_dag = merge_base_dags(
+        (dags["jac_nuc"], dags["rhs_specie"], dags["rhs_eint"])
+    )
+    base_partition = partition(base_dag, warps, threshold, batch_cells)
     total_exchange = sum(part.exchange_bytes for part in partitions.values())
     if total_exchange > max_exchange_bytes:
         raise DagError(
             f"exchange arena requires {total_exchange} bytes, exceeds "
+            f"{max_exchange_bytes}"
+        )
+    if base_partition.exchange_bytes > max_exchange_bytes:
+        raise DagError(
+            f"fused base exchange arena requires "
+            f"{base_partition.exchange_bytes} bytes, exceeds "
             f"{max_exchange_bytes}"
         )
 
@@ -1242,6 +1332,17 @@ def generate(
         shared_wave_warps,
         shared_warp_order,
     )
+    base_shared = emit_shared_file(
+        output_dir / "slices_base_shared.mojo",
+        source_hash,
+        [base_dag],
+        [base_partition],
+        warps,
+        threshold,
+        shared_region_definitions,
+        shared_wave_warps,
+        shared_warp_order,
+    )
     emit_file(
         output_dir / "slices_rhs.mojo",
         source_hash,
@@ -1261,6 +1362,17 @@ def generate(
     report["shared_scratch"] = {
         "jacobian": jac_shared,
         "rhs": rhs_shared,
+        "base": base_shared,
+    }
+    report["fused_base"] = {
+        "input_definitions": sum(len(dag.definitions) for dag in dags.values()),
+        "definitions": len(base_dag.definitions),
+        "eliminated_definitions": (
+            sum(len(dag.definitions) for dag in dags.values())
+            - len(base_dag.definitions)
+        ),
+        "outputs": len(base_dag.outputs),
+        "exchange_bytes": base_partition.exchange_bytes,
     }
     report["generated_source_bytes"] = {
         name: (output_dir / name).stat().st_size
@@ -1269,6 +1381,7 @@ def generate(
             "slices_rhs.mojo",
             "slices_jac_shared.mojo",
             "slices_rhs_shared.mojo",
+            "slices_base_shared.mojo",
         )
     }
     (output_dir / "slice_report.json").write_text(

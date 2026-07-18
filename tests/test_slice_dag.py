@@ -93,6 +93,7 @@ class SliceDagGenerationTests(unittest.TestCase):
                 "slices_rhs.mojo",
                 "slices_jac_shared.mojo",
                 "slices_rhs_shared.mojo",
+                "slices_base_shared.mojo",
                 "slice_report.json",
             ):
                 self.assertEqual(
@@ -117,6 +118,17 @@ class SliceDagGenerationTests(unittest.TestCase):
                 parsed["shared_scratch"]["rhs"]["exchange_slots"], 13
             )
             self.assertEqual(
+                parsed["shared_scratch"]["base"]["scratch_slots"], 531
+            )
+            self.assertEqual(
+                parsed["shared_scratch"]["base"]["exchange_slots"], 15
+            )
+            self.assertEqual(parsed["fused_base"]["definitions"], 1113)
+            self.assertEqual(
+                parsed["fused_base"]["eliminated_definitions"], 562
+            )
+            self.assertEqual(parsed["fused_base"]["outputs"], 240)
+            self.assertEqual(
                 parsed["shared_scratch"]["rhs"]["exchange_producers"][0][
                     "definitions"
                 ],
@@ -125,6 +137,10 @@ class SliceDagGenerationTests(unittest.TestCase):
             self.assertIn(
                 "def rhs_specie_exchange_shared(",
                 (Path(first) / "slices_rhs_shared.mojo").read_text(),
+            )
+            self.assertIn(
+                "def base_exchange_shared(",
+                (Path(first) / "slices_base_shared.mojo").read_text(),
             )
             self.assertEqual(
                 parsed["shared_scratch"]["jacobian"]["wave_warps"],

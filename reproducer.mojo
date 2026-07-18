@@ -3124,22 +3124,54 @@ def selected_cell_value(state: CollapseState, field: Int) -> Float64:
     return Float64(state.stats.rejected_steps)
 
 
+def select_kth(mut values: List[Float64], k: Int) -> Float64:
+    var left = 0
+    var right = len(values) - 1
+    while True:
+        if left == right:
+            return values[left]
+        var pivot = values[left + (right - left) // 2]
+        var lower = left
+        var current = left
+        var upper = right
+        while current <= upper:
+            if values[current] < pivot:
+                var temporary = values[lower]
+                values[lower] = values[current]
+                values[current] = temporary
+                lower += 1
+                current += 1
+            elif values[current] > pivot:
+                var temporary = values[upper]
+                values[upper] = values[current]
+                values[current] = temporary
+                upper -= 1
+            else:
+                current += 1
+        if k < lower:
+            right = lower - 1
+        elif k > upper:
+            left = upper + 1
+        else:
+            return pivot
+
+
 def summarize_cells(cells: List[CollapseState], field: Int) -> ValueSummary:
     var values = List[Float64](capacity=len(cells))
+    var minimum = Float64.MAX
+    var maximum = -Float64.MAX
     for cell in range(len(cells)):
-        values.append(selected_cell_value(cells[cell], field))
-    for i in range(1, len(values)):
-        var value = values[i]
-        var j = i
-        while j > 0 and values[j - 1] > value:
-            values[j] = values[j - 1]
-            j -= 1
-        values[j] = value
+        var value = selected_cell_value(cells[cell], field)
+        values.append(value)
+        if value < minimum:
+            minimum = value
+        if value > maximum:
+            maximum = value
     var middle = len(values) // 2
-    var median = values[middle]
+    var median = select_kth(values, middle)
     if len(values) % 2 == 0:
-        median = 0.5 * (values[middle - 1] + values[middle])
-    return ValueSummary(values[0], median, values[len(values) - 1])
+        median = 0.5 * (select_kth(values, middle - 1) + median)
+    return ValueSummary(minimum, median, maximum)
 
 
 def print_summary(label: String, summary: ValueSummary):

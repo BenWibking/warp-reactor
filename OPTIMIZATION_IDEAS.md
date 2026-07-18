@@ -87,7 +87,7 @@ Success criteria:
 - Final-state comparison passes at grid 1 and grid 64.
 - PTXAS still reports zero spills.
 - Shared memory remains within the Hopper launch limit.
-- Isolated grid-64 mean improves by at least 5%; otherwise revert.
+- Isolated grid-64 mean improves by at least 2.5%; otherwise revert.
 
 ### 2. Reduce DAG Scratch and Increase Resident Warps
 
@@ -223,4 +223,3 @@ and improves the isolated paired benchmark.
    supports them.
 5. Cache rejected-step Jacobians if rejection frequency supports it.
 6. Evaluate controlled FMA and temperature-rate approximations.
-

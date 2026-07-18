@@ -537,42 +537,6 @@ def prepare_dag_inputs[BaseLayout: TensorLayout](
     barrier()
 
 
-def evaluate_jacobian_shared(
-    inputs: structured_ops.SharedPointer,
-    jacobian: structured_ops.SharedPointer,
-    scratch: structured_ops.SharedPointer,
-    physical_warp: Int,
-    physical_lane: Int,
-    active_cells: Int,
-):
-    if (
-        physical_warp < structured_ops.DagFirstWaveWarps
-        and physical_lane < active_cells
-    ):
-        structured_ops.dispatch_jac_slice_shared(
-            structured_ops.first_wave_logical_warp(physical_warp),
-            inputs,
-            jacobian,
-            scratch,
-            physical_lane,
-            reproducer.redshift(),
-        )
-    barrier()
-    if (
-        physical_warp < structured_ops.DagSecondWaveWarps
-        and physical_lane < active_cells
-    ):
-        structured_ops.dispatch_jac_slice_shared(
-            structured_ops.second_wave_logical_warp(physical_warp),
-            inputs,
-            jacobian,
-            scratch,
-            physical_lane,
-            reproducer.redshift(),
-        )
-    barrier()
-
-
 def evaluate_rhs_shared(
     inputs: structured_ops.SharedPointer,
     rhs: structured_ops.SharedPointer,
@@ -621,6 +585,57 @@ def evaluate_rhs_shared(
     barrier()
 
 
+def evaluate_base_shared(
+    inputs: structured_ops.SharedPointer,
+    jacobian: structured_ops.SharedPointer,
+    rhs: structured_ops.SharedPointer,
+    exchange: structured_ops.SharedPointer,
+    scratch: structured_ops.SharedPointer,
+    physical_warp: Int,
+    physical_lane: Int,
+    active_cells: Int,
+):
+    if physical_warp == 0 and physical_lane < active_cells:
+        structured_ops.produce_base_exchange_shared(
+            inputs,
+            exchange,
+            scratch,
+            physical_lane,
+            reproducer.redshift(),
+        )
+    barrier()
+    if (
+        physical_warp < structured_ops.DagFirstWaveWarps
+        and physical_lane < active_cells
+    ):
+        structured_ops.dispatch_base_slice_shared(
+            structured_ops.first_wave_logical_warp(physical_warp),
+            inputs,
+            jacobian,
+            rhs,
+            exchange,
+            scratch,
+            physical_lane,
+            reproducer.redshift(),
+        )
+    barrier()
+    if (
+        physical_warp < structured_ops.DagSecondWaveWarps
+        and physical_lane < active_cells
+    ):
+        structured_ops.dispatch_base_slice_shared(
+            structured_ops.second_wave_logical_warp(physical_warp),
+            inputs,
+            jacobian,
+            rhs,
+            exchange,
+            scratch,
+            physical_lane,
+            reproducer.redshift(),
+        )
+    barrier()
+
+
 def structured_trial_kernel[
     StateLayout: TensorLayout,
     ErrorLayout: TensorLayout,
@@ -652,7 +667,7 @@ def structured_trial_kernel[
     var scratch = jacobian + structured_ops.DagScratchOffset
     var rhs = jacobian + structured_ops.RhsOffset
     var dag_inputs = jacobian + structured_ops.DagInputOffset
-    var rhs_exchange = jacobian + structured_ops.RhsExchangeOffset
+    var rhs_exchange = jacobian + structured_ops.DagExchangeOffset
     var stage_y = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells, reproducer.Neqs]())
@@ -701,9 +716,11 @@ def structured_trial_kernel[
     comptime e2 = -0.23570226039551567
     comptime e3 = -0.13807118745769906
     prepare_dag_inputs(base, dag_inputs, tid, active_cells)
-    evaluate_jacobian_shared(
+    evaluate_base_shared(
         dag_inputs,
         jacobian,
+        rhs,
+        rhs_exchange,
         scratch,
         physical_warp,
         physical_lane,
@@ -728,17 +745,6 @@ def structured_trial_kernel[
     barrier()
     factorize_shared(
         jacobian, participating, tile_cell, lane, pivots, infos
-    )
-
-    prepare_dag_inputs(base, dag_inputs, tid, active_cells)
-    evaluate_rhs_shared(
-        dag_inputs,
-        rhs,
-        rhs_exchange,
-        scratch,
-        physical_warp,
-        physical_lane,
-        active_cells,
     )
     solve_shared(
         jacobian, rhs, participating, tile_cell, lane, pivots, infos
@@ -928,7 +934,7 @@ def structured_chemistry_kernel[
     var scratch = jacobian + structured_ops.DagScratchOffset
     var rhs = jacobian + structured_ops.RhsOffset
     var dag_inputs = jacobian + structured_ops.DagInputOffset
-    var rhs_exchange = jacobian + structured_ops.RhsExchangeOffset
+    var rhs_exchange = jacobian + structured_ops.DagExchangeOffset
     var stage_y = stack_allocation[
         DType.float64, address_space=AddressSpace.SHARED
     ](row_major[structured_ops.TileCells, reproducer.Neqs]())
@@ -1072,9 +1078,11 @@ def structured_chemistry_kernel[
         barrier()
 
         prepare_dag_inputs(base, dag_inputs, tid, active_cells)
-        evaluate_jacobian_shared(
+        evaluate_base_shared(
             dag_inputs,
             jacobian,
+            rhs,
+            rhs_exchange,
             scratch,
             physical_warp,
             physical_lane,
@@ -1110,17 +1118,6 @@ def structured_chemistry_kernel[
                 if rebind[Scalar[DType.int32]](infos[owner]) != 0:
                     control_i32[1] = Int32(1)
         barrier()
-
-        prepare_dag_inputs(base, dag_inputs, tid, active_cells)
-        evaluate_rhs_shared(
-            dag_inputs,
-            rhs,
-            rhs_exchange,
-            scratch,
-            physical_warp,
-            physical_lane,
-            active_cells,
-        )
         solve_shared(
             jacobian, rhs, participating, tile_cell, lane, pivots, infos
         )
