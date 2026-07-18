@@ -1,4 +1,4 @@
-# Chemical kinetic reproducer (Quokka)
+# Chemical kinetics miniapp
 
 `reproducer.cpp` is a standalone translation unit for the primordial chemistry
 collapse-grid reproducer. Run the commands below from this directory.
