@@ -7,10 +7,19 @@ reproducer
 reproducer_mojo
 reproducer_cuda
 reproducer_hip
+reproducer_gpu
+reproducer_structured_gpu
+reproducer_cuda_structured
+test_structured_dag
+test_structured_trial
+test_warp_lu
 
 # generated interpreter caches
 __pycache__/
 *.pyc
+
+# generated chemistry DAG sources
+generated/
 
 # comparator diagnostics and local benchmark artifacts
 final_state_comparison_failures_*.csv

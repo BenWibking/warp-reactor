@@ -46,10 +46,10 @@ module load "${cuda_module}"
     sha256sum "${cooperative_bin}" "${per_thread_bin}"
     git -C "${repo}" rev-parse HEAD
     sha256sum \
-        "${repo}/structured_trial.mojo" \
-        "${repo}/structured_ops.mojo" \
+        "${repo}/src/gpu/structured_trial.mojo" \
+        "${repo}/src/gpu/structured_ops.mojo" \
         "${repo}/reproducer.mojo" \
-        "${repo}/reproducer_structured_gpu.mojo"
+        "${repo}/apps/reproducer_structured_gpu.mojo"
 } >"${run_dir}/environment.txt" 2>&1
 
 snapshot_gpu() {

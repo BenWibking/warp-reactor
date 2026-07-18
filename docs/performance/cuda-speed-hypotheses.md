@@ -421,6 +421,7 @@ worth more than the spill traffic it incurs.
 - `benchmarks/ncu_grid64_compare.slurm`
 - CUDA controller and LU: `reproducer.cpp:97`, `reproducer.cpp:7205`, and
   `reproducer.cpp:7734`
-- Structured scheduling and LU: `structured_ops.mojo:59`,
-  `structured_trial.mojo:195`, `structured_trial.mojo:540`, and
-  `structured_trial.mojo:902`
+- Structured scheduling and LU: `src/gpu/structured_ops.mojo:59`,
+  `src/gpu/structured_trial.mojo:195`,
+  `src/gpu/structured_trial.mojo:540`, and
+  `src/gpu/structured_trial.mojo:902`

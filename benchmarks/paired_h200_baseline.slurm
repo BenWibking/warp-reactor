@@ -50,7 +50,7 @@ nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=c
 
 if [[ -z "${PREBUILT_BIN_DIR:-}" ]]; then
     mkdir -p "${bin_dir}"
-    pixi run mojo build -I . reproducer_structured_gpu.mojo \
+    pixi run mojo build -I . -I src/gpu apps/reproducer_structured_gpu.mojo \
         -o "${bin_dir}/reproducer_structured" \
         >"${run_dir}/build-structured.log" 2>&1
 

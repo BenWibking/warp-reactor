@@ -70,7 +70,7 @@ Authoritative jobs and raw artifacts:
 `tools/slice_dag.py` now constructs a combined DAG from `jac_nuc`,
 `rhs_specie`, and `rhs_eint`, canonicalizes structurally identical
 definitions across the three functions, and emits
-`generated/slices_base_shared.mojo`. `structured_trial.mojo` prepares the base
+`generated/slices_base_shared.mojo`. `src/gpu/structured_trial.mojo` prepares the base
 state once and emits the Jacobian and first RHS together before LU
 factorization.
 
@@ -193,7 +193,7 @@ Consequently no explicit-FMA source variant was retained.
 - `python3 -m unittest tests.test_slice_dag`: 11 passed.
 - `pixi run mojo run -I . tests/test_slice_dag.mojo`: 1 passed.
 - `pixi run mojo run -I . tests/test_summary.mojo`: 2 passed.
-- `pixi run mojo run -I . test_grid_timestep_reference.mojo`: 9 passed.
+- `pixi run test-grid-timestep`: 9 passed.
 - Retained structured GPU executable built successfully for H200.
 - Grid-1 GPU/CPU final-state comparison passed.
 - Grid-64 fused/baseline comparisons passed on all three measured runs.

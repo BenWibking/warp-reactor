@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# ABOUTME: Hopper 32-cell structured Mojo GPU chemistry driver.
+# ABOUTME: Shared host lifecycle for grid-wide Mojo GPU chemistry adapters.
 
 import reproducer
 import reproducer_gpu
@@ -12,17 +12,76 @@ from std.math import ceildiv, isfinite
 from std.time import perf_counter_ns
 
 
-def main() raises:
+def print_structured_summary(
+    cells: List[reproducer.CollapseState],
+    num_cells: Int,
+    limiting_cell: Int,
+):
+    print("limiting cell:", limiting_cell)
+    if num_cells == 1:
+        print("representative cell completed steps:", cells[0].completed_steps)
+        print("representative cell physical time:", cells[0].time)
+        print("representative cell density driver:", cells[0].density_driver)
+        var total_stats = reproducer.IntegratorStats()
+        reproducer.add_stats(total_stats, cells[0].stats)
+        print("ROS2S internal steps:", total_stats.internal_steps)
+        print("ROS2S rhs calls:", total_stats.rhs_calls)
+        print("ROS2S jacobian calls:", total_stats.jacobian_calls)
+        print("ROS2S decompositions:", total_stats.decompositions)
+        print("ROS2S linear solves:", total_stats.linear_solves)
+        print(
+            "ROS2S accepted/rejected:",
+            total_stats.accepted_steps,
+            "/",
+            total_stats.rejected_steps,
+        )
+    else:
+        reproducer.print_summary(
+            "cell completed steps", reproducer.summarize_cells(cells, 0)
+        )
+        reproducer.print_summary(
+            "cell physical time", reproducer.summarize_cells(cells, 1)
+        )
+        reproducer.print_summary(
+            "cell density driver", reproducer.summarize_cells(cells, 2)
+        )
+        reproducer.print_summary(
+            "ROS2S internal steps", reproducer.summarize_cells(cells, 3)
+        )
+        reproducer.print_summary(
+            "ROS2S rhs calls", reproducer.summarize_cells(cells, 4)
+        )
+        reproducer.print_summary(
+            "ROS2S jacobian calls", reproducer.summarize_cells(cells, 5)
+        )
+        reproducer.print_summary(
+            "ROS2S decompositions", reproducer.summarize_cells(cells, 6)
+        )
+        reproducer.print_summary(
+            "ROS2S linear solves", reproducer.summarize_cells(cells, 7)
+        )
+        reproducer.print_summary(
+            "ROS2S accepted steps", reproducer.summarize_cells(cells, 8)
+        )
+        reproducer.print_summary(
+            "ROS2S rejected steps", reproducer.summarize_cells(cells, 9)
+        )
+
+
+def _run_gridwide[use_structured: Bool](
+    program_name: String, backend_name: String
+) raises:
     var options = reproducer.parse_args()
     if options.show_help:
-        reproducer.print_usage("reproducer_structured_gpu")
+        reproducer.print_usage(program_name)
         return
     if options.driver_policy != reproducer.GridwideCta32Policy:
         raise Error(
-            "reproducer_structured_gpu requires --driver-policy gridwide-cta32"
+            t"{program_name} requires --driver-policy gridwide-cta32"
         )
+
     var num_cells = reproducer.checked_cell_count(options.grid_dim)
-    var num_tiles = ceildiv(num_cells, structured_ops.TileCells)
+    var num_tiles = ceildiv(num_cells, reproducer.TileCells)
     var cells = List[reproducer.CollapseState]()
     for _ in range(num_cells):
         cells.append(reproducer.make_collapse_state())
@@ -87,13 +146,21 @@ def main() raises:
         type_of(tile_layout),
         type_of(failure_layout),
     ]
-    comptime chemistry = structured_trial.structured_chemistry_kernel[
+    comptime baseline_chemistry = reproducer_gpu.chemistry_kernel[
         type_of(state_layout),
         type_of(step_layout),
         type_of(stats_layout),
         type_of(tile_layout),
         type_of(failure_layout),
     ]
+    comptime structured_chemistry = structured_trial.structured_chemistry_kernel[
+        type_of(state_layout),
+        type_of(step_layout),
+        type_of(stats_layout),
+        type_of(tile_layout),
+        type_of(failure_layout),
+    ]
+
     var completed_global_steps = 0
     var grid_time = 0.0
     var failed = reproducer.Success
@@ -117,6 +184,7 @@ def main() raises:
             block_dim=WARP_SIZE,
         )
         ctx.synchronize()
+
         var dt_grid = Float64.MAX
         limiting_cell = Int.MAX
         with min_buffer.map_to_host() as mapped_minima:
@@ -137,27 +205,46 @@ def main() raises:
             failed = Int(mapped_failure[0])
         if failed != reproducer.Success or limiting_cell == Int.MAX:
             break
+
         var next_grid_time = grid_time + dt_grid
         if not reproducer.valid_positive(dt_grid) or not isfinite(next_grid_time):
             failed = reproducer.BadInputs
             break
+
         integrated_buffer.enqueue_fill(Int32(0))
-        ctx.enqueue_function[chemistry](
-            state_tensor,
-            step_tensor,
-            stats_tensor,
-            integrated,
-            failure,
-            num_cells,
-            completed_global_steps,
-            grid_time,
-            next_grid_time,
-            dt_grid,
-            grid_dim=num_tiles,
-            block_dim=structured_ops.BlockThreads,
-            shared_mem_bytes=structured_ops.DynamicSharedBytes,
-        )
+        comptime if use_structured:
+            ctx.enqueue_function[structured_chemistry](
+                state_tensor,
+                step_tensor,
+                stats_tensor,
+                integrated,
+                failure,
+                num_cells,
+                completed_global_steps,
+                grid_time,
+                next_grid_time,
+                dt_grid,
+                grid_dim=num_tiles,
+                block_dim=structured_ops.BlockThreads,
+                shared_mem_bytes=structured_ops.DynamicSharedBytes,
+            )
+        else:
+            ctx.enqueue_function[baseline_chemistry](
+                state_tensor,
+                step_tensor,
+                stats_tensor,
+                integrated,
+                failure,
+                num_cells,
+                completed_global_steps,
+                grid_time,
+                next_grid_time,
+                dt_grid,
+                grid_dim=num_tiles,
+                block_dim=WARP_SIZE,
+            )
         ctx.synchronize()
+
         var integrated_count = 0
         with integrated_buffer.map_to_host() as mapped_integrated:
             for tile in range(num_tiles):
@@ -168,6 +255,7 @@ def main() raises:
             break
         grid_time = next_grid_time
         completed_global_steps += 1
+
     var elapsed = Float64(perf_counter_ns() - start) * 1.0e-9
     if failed != reproducer.Success:
         raise Error(t"GPU integration failed with code {failed}")
@@ -215,64 +303,18 @@ def main() raises:
                     cells[cell].stats.rejected_steps = Int(
                         mapped_stats[6 * num_cells + cell]
                     )
+
     print("Primordial chemistry collapse grid with ROS2S")
-    print("backend: mojo-gpu-structured-hopper")
+    print("backend:", backend_name)
     print("grid:", options.grid_dim, "^3 (", num_cells, "cells )")
-    print("perturbations:", "enabled" if options.perturb else "disabled")
+    comptime if use_structured:
+        print("perturbations:", "enabled" if options.perturb else "disabled")
     print("driver policy: gridwide-cta32")
     print("completed global collapse steps:", completed_global_steps)
-    print("limiting cell:", limiting_cell)
-    if num_cells == 1:
-        print("representative cell completed steps:", cells[0].completed_steps)
-        print("representative cell physical time:", cells[0].time)
-        print("representative cell density driver:", cells[0].density_driver)
-    else:
-        reproducer.print_summary(
-            "cell completed steps", reproducer.summarize_cells(cells, 0)
-        )
-        reproducer.print_summary(
-            "cell physical time", reproducer.summarize_cells(cells, 1)
-        )
-        reproducer.print_summary(
-            "cell density driver", reproducer.summarize_cells(cells, 2)
-        )
+    comptime if use_structured:
+        print_structured_summary(cells, num_cells, limiting_cell)
     print("wall time:", elapsed, "s")
-    if num_cells == 1:
-        var total_stats = reproducer.IntegratorStats()
-        reproducer.add_stats(total_stats, cells[0].stats)
-        print("ROS2S internal steps:", total_stats.internal_steps)
-        print("ROS2S rhs calls:", total_stats.rhs_calls)
-        print("ROS2S jacobian calls:", total_stats.jacobian_calls)
-        print("ROS2S decompositions:", total_stats.decompositions)
-        print("ROS2S linear solves:", total_stats.linear_solves)
-        print(
-            "ROS2S accepted/rejected:",
-            total_stats.accepted_steps,
-            "/",
-            total_stats.rejected_steps,
-        )
-    else:
-        reproducer.print_summary(
-            "ROS2S internal steps", reproducer.summarize_cells(cells, 3)
-        )
-        reproducer.print_summary(
-            "ROS2S rhs calls", reproducer.summarize_cells(cells, 4)
-        )
-        reproducer.print_summary(
-            "ROS2S jacobian calls", reproducer.summarize_cells(cells, 5)
-        )
-        reproducer.print_summary(
-            "ROS2S decompositions", reproducer.summarize_cells(cells, 6)
-        )
-        reproducer.print_summary(
-            "ROS2S linear solves", reproducer.summarize_cells(cells, 7)
-        )
-        reproducer.print_summary(
-            "ROS2S accepted steps", reproducer.summarize_cells(cells, 8)
-        )
-        reproducer.print_summary(
-            "ROS2S rejected steps", reproducer.summarize_cells(cells, 9)
-        )
+
     if options.compare_final_state_path != "":
         if not reproducer.compare_final_states_from_file(
             cells,
@@ -288,5 +330,16 @@ def main() raises:
             options.write_final_state_path,
             reproducer.GridwideCta32Policy,
         )
-    if options.grid_dim == 1:
-        reproducer.print_state(cells[0].current)
+    comptime if use_structured:
+        if options.grid_dim == 1:
+            reproducer.print_state(cells[0].current)
+
+
+def run_baseline() raises:
+    _run_gridwide[False]("reproducer_gpu", "mojo-gpu-dataparallel")
+
+
+def run_structured() raises:
+    _run_gridwide[True](
+        "reproducer_structured_gpu", "mojo-gpu-structured-hopper"
+    )

@@ -663,10 +663,10 @@ run only on the Linux+GPU machine; everything else runs on CPU anywhere.
 
 | # | Test | Type | Where | Asserts |
 |---|---|---|---|---|
-| T0 | `test_grid_timestep_reference.mojo` | unit | CPU | stable `(dt, cell)` minimum, terminal `dt<10` update, density-limit stop, invalid-state failure, no-active termination, common density update, and exact common output time |
+| T0 | `tests/integration/test_grid_timestep_reference.mojo` | unit | CPU | stable `(dt, cell)` minimum, terminal `dt<10` update, density-limit stop, invalid-state failure, no-active termination, common density update, and exact common output time |
 | T1 | `test_gpu_dataparallel_final_state.mojo` | e2e | GPU | one-thread-per-cell-trial Mojo baseline with the grid-timestep prepass and common CTA controller; grid-1 final state matches CPU Mojo within tolerance |
 | T2 | `tests/test_slice_dag.py` + `.mojo` | unit | CPU | Python parser tests reject malformed/drifted input and prove deterministic generation; Mojo sliced J/RHS is bitwise-equal to monolithic on fixtures/log-random/X-floor cases, with reviewed `nextafter` cases and two-sided generated-branch coverage |
-| T3 | `test_warp_lu.mojo` | unit | GPU | column-owned LU+solve vs CPU LU on identity, exact-singular, forced-row-swap, pivot-tie, random, and near-singular 15×15 systems; residual/backward-error bounds hold |
+| T3 | `tests/gpu/test_warp_lu.mojo` | unit | GPU | column-owned LU+solve vs CPU LU on identity, exact-singular, forced-row-swap, pivot-tie, random, and near-singular 15×15 systems; residual/backward-error bounds hold |
 | T4 | `test_structured_kernel_grid1.mojo` | integration | GPU | warp-specialized kernel grid-1 final state ≈ CPU reference |
 | T5 | `test_structured_kernel_grid64.mojo` | e2e | GPU | grid-64 output passes the new grid-wide-policy reference comparator; wall time, code/resource data, and spills are recorded |
 | T6 | `test_unified_controller.mojo` | integration | CPU+GPU | CPU/GPU CTA traces agree within tolerance; a rejection or singular LU in any batch discards every batch candidate, retries the whole CTA with one `h`, and all participants finish at `dt_grid` |
@@ -831,9 +831,9 @@ c++ -std=c++20 -O3 -I. reproducer.cpp -o reproducer
 ./reproducer --grid 1 --no-compare-final-state
 
 # planned tests (CPU parts, after M0/M2)
-pixi run mojo run test_grid_timestep_reference.mojo
-pixi run python3 -m unittest tests/test_slice_dag.py
-pixi run mojo run tests/test_slice_dag.mojo
+pixi run test-grid-timestep
+pixi run test-slice-dag-python
+pixi run test-slice-dag-mojo
 
 # generate the new-policy CPU oracle (after M0)
 ./reproducer_mojo --grid 64 --driver-policy gridwide-cta32 \
@@ -841,9 +841,8 @@ pixi run mojo run tests/test_slice_dag.mojo
   --no-compare-final-state
 
 # GPU machine: baseline + structured kernel (after M1/M4)
-pixi run mojo build reproducer_gpu.mojo -o reproducer_gpu
-pixi run mojo build -I . reproducer_structured_gpu.mojo \
-  -o reproducer_structured_gpu
+pixi run build-gpu
+pixi run build-structured-gpu
 ./reproducer_gpu --grid 1 --no-compare-final-state
 ./reproducer_structured_gpu --grid 64 \
   --compare-final-state final_states_grid64_cpu_gridwide.bin

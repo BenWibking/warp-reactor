@@ -1,14 +1,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# ABOUTME: Data-parallel Mojo GPU baseline for the gridwide-cta32 policy.
+# ABOUTME: Shared grid preparation and data-parallel GPU chemistry kernels.
 
 import reproducer
 from layout import TensorLayout, TileTensor, row_major, stack_allocation
-from std.gpu import WARP_SIZE, barrier, block_idx, lane_id
-from std.gpu.host import DeviceContext
+from std.gpu import barrier, block_idx, lane_id
 from std.gpu.memory import AddressSpace
 from std.gpu.primitives import warp
-from std.math import abs, ceildiv, exp, isfinite, log, max, min
-from std.time import perf_counter_ns
+from std.math import abs, exp, isfinite, log, max, min
 
 
 comptime StateFields = 19
@@ -188,18 +186,14 @@ def prepare_grid_timestep_kernel[
                     candidate = dt
                     candidate_cell = cell
                 # Preparation owns every mutation it makes, including perturbation.
-                store_f64(
-                    state_tensor, RhoField, cell, collapse.current.rho
-                )
+                store_f64(state_tensor, RhoField, cell, collapse.current.rho)
                 store_f64(
                     state_tensor,
                     TemperatureField,
                     cell,
                     collapse.current.T,
                 )
-                store_f64(
-                    state_tensor, EnergyField, cell, collapse.current.e
-                )
+                store_f64(state_tensor, EnergyField, cell, collapse.current.e)
                 for n in range(reproducer.NumSpec):
                     store_f64(
                         state_tensor,
@@ -419,201 +413,3 @@ def chemistry_kernel[
         )
         if status != reproducer.Success:
             failure[0] = Int32(status)
-
-
-def main() raises:
-    var options = reproducer.parse_args()
-    if options.show_help:
-        reproducer.print_usage("reproducer_gpu")
-        return
-    if options.driver_policy != reproducer.GridwideCta32Policy:
-        raise Error(
-            "reproducer_gpu requires --driver-policy gridwide-cta32"
-        )
-    var num_cells = reproducer.checked_cell_count(options.grid_dim)
-    var num_tiles = ceildiv(num_cells, reproducer.TileCells)
-    var cells = List[reproducer.CollapseState]()
-    for _ in range(num_cells):
-        cells.append(reproducer.make_collapse_state())
-
-    var ctx = DeviceContext()
-    var state_buffer = ctx.enqueue_create_buffer[DType.float64](
-        StateFields * num_cells
-    )
-    var step_buffer = ctx.enqueue_create_buffer[DType.int32](num_cells)
-    var stats_buffer = ctx.enqueue_create_buffer[DType.uint64](
-        StatsFields * num_cells
-    )
-    var min_buffer = ctx.enqueue_create_buffer[DType.float64](num_tiles)
-    var id_buffer = ctx.enqueue_create_buffer[DType.int32](num_tiles)
-    var integrated_buffer = ctx.enqueue_create_buffer[DType.int32](num_tiles)
-    var failure_buffer = ctx.enqueue_create_buffer[DType.int32](1)
-    var state_layout = row_major(StateFields, num_cells)
-    var step_layout = row_major(num_cells)
-    var stats_layout = row_major(StatsFields, num_cells)
-    var tile_layout = row_major(num_tiles)
-    var failure_layout = row_major(1)
-    var state_tensor = TileTensor(state_buffer, state_layout)
-    var step_tensor = TileTensor(step_buffer, step_layout)
-    var stats_tensor = TileTensor(stats_buffer, stats_layout)
-    var minima = TileTensor(min_buffer, tile_layout)
-    var minimum_cells = TileTensor(id_buffer, tile_layout)
-    var integrated = TileTensor(integrated_buffer, tile_layout)
-    var failure = TileTensor(failure_buffer, failure_layout)
-
-    with state_buffer.map_to_host() as mapped_state:
-        with step_buffer.map_to_host() as mapped_steps:
-            with stats_buffer.map_to_host() as mapped_stats:
-                for cell in range(num_cells):
-                    mapped_state[RhoField * num_cells + cell] = cells[cell].current.rho
-                    mapped_state[TemperatureField * num_cells + cell] = cells[cell].current.T
-                    mapped_state[EnergyField * num_cells + cell] = cells[cell].current.e
-                    for n in range(reproducer.NumSpec):
-                        mapped_state[(SpeciesField + n) * num_cells + cell] = cells[cell].current.xn[n]
-                    mapped_state[TimeField * num_cells + cell] = cells[cell].time
-                    mapped_state[DriverField * num_cells + cell] = cells[cell].density_driver
-                    mapped_steps[cell] = Int32(cells[cell].completed_steps)
-                    mapped_stats[cell] = UInt64(cells[cell].stats.internal_steps)
-                    mapped_stats[num_cells + cell] = UInt64(cells[cell].stats.rhs_calls)
-                    mapped_stats[2 * num_cells + cell] = UInt64(cells[cell].stats.jacobian_calls)
-                    mapped_stats[3 * num_cells + cell] = UInt64(cells[cell].stats.decompositions)
-                    mapped_stats[4 * num_cells + cell] = UInt64(cells[cell].stats.linear_solves)
-                    mapped_stats[5 * num_cells + cell] = UInt64(cells[cell].stats.accepted_steps)
-                    mapped_stats[6 * num_cells + cell] = UInt64(cells[cell].stats.rejected_steps)
-
-    comptime prepare = prepare_grid_timestep_kernel[
-        type_of(state_layout),
-        type_of(step_layout),
-        type_of(stats_layout),
-        type_of(tile_layout),
-        type_of(tile_layout),
-        type_of(failure_layout),
-    ]
-    comptime chemistry = chemistry_kernel[
-        type_of(state_layout),
-        type_of(step_layout),
-        type_of(stats_layout),
-        type_of(tile_layout),
-        type_of(failure_layout),
-    ]
-    var completed_global_steps = 0
-    var grid_time = 0.0
-    var failed = reproducer.Success
-    var start = perf_counter_ns()
-    for step in range(reproducer.MaxCollapseSteps):
-        failure_buffer.enqueue_fill(Int32(reproducer.Success))
-        ctx.enqueue_function[prepare](
-            state_tensor,
-            step_tensor,
-            stats_tensor,
-            minima,
-            minimum_cells,
-            failure,
-            num_cells,
-            completed_global_steps,
-            grid_time,
-            step,
-            Int32(options.perturb),
-            grid_dim=num_tiles,
-            block_dim=WARP_SIZE,
-        )
-        ctx.synchronize()
-        var dt_grid = Float64.MAX
-        var limiting_cell = Int.MAX
-        with min_buffer.map_to_host() as mapped_minima:
-            var host_minima = TileTensor(mapped_minima, tile_layout)
-            with id_buffer.map_to_host() as mapped_ids:
-                var host_ids = TileTensor(mapped_ids, tile_layout)
-                for tile in range(num_tiles):
-                    var dt = rebind[Scalar[DType.float64]](host_minima[tile])
-                    var cell = Int(
-                        rebind[Scalar[DType.int32]](host_ids[tile])
-                    )
-                    if dt < dt_grid or (dt == dt_grid and cell < limiting_cell):
-                        dt_grid = dt
-                        limiting_cell = cell
-        with failure_buffer.map_to_host() as mapped_failure:
-            var host_failure = TileTensor(mapped_failure, failure_layout)
-            failed = Int(rebind[Scalar[DType.int32]](host_failure[0]))
-        if failed != reproducer.Success:
-            break
-        if limiting_cell == Int.MAX:
-            break
-        var next_grid_time = grid_time + dt_grid
-        if not reproducer.valid_positive(dt_grid) or not isfinite(next_grid_time):
-            failed = reproducer.BadInputs
-            break
-        integrated_buffer.enqueue_fill(Int32(0))
-        ctx.enqueue_function[chemistry](
-            state_tensor,
-            step_tensor,
-            stats_tensor,
-            integrated,
-            failure,
-            num_cells,
-            completed_global_steps,
-            grid_time,
-            next_grid_time,
-            dt_grid,
-            grid_dim=num_tiles,
-            block_dim=WARP_SIZE,
-        )
-        ctx.synchronize()
-        var integrated_count = 0
-        with integrated_buffer.map_to_host() as mapped_integrated:
-            var host_integrated = TileTensor(mapped_integrated, tile_layout)
-            for tile in range(num_tiles):
-                integrated_count += Int(
-                    rebind[Scalar[DType.int32]](host_integrated[tile])
-                )
-        with failure_buffer.map_to_host() as mapped_failure:
-            var host_failure = TileTensor(mapped_failure, failure_layout)
-            failed = Int(rebind[Scalar[DType.int32]](host_failure[0]))
-        if failed != reproducer.Success or integrated_count == 0:
-            break
-        grid_time = next_grid_time
-        completed_global_steps += 1
-    var elapsed = Float64(perf_counter_ns() - start) * 1.0e-9
-    if failed != reproducer.Success:
-        raise Error(t"GPU integration failed with code {failed}")
-
-    with state_buffer.map_to_host() as mapped_state:
-        with step_buffer.map_to_host() as mapped_steps:
-            with stats_buffer.map_to_host() as mapped_stats:
-                for cell in range(num_cells):
-                    cells[cell].current.rho = mapped_state[RhoField * num_cells + cell]
-                    cells[cell].current.T = mapped_state[TemperatureField * num_cells + cell]
-                    cells[cell].current.e = mapped_state[EnergyField * num_cells + cell]
-                    for n in range(reproducer.NumSpec):
-                        cells[cell].current.xn[n] = mapped_state[(SpeciesField + n) * num_cells + cell]
-                    cells[cell].time = mapped_state[TimeField * num_cells + cell]
-                    cells[cell].density_driver = mapped_state[DriverField * num_cells + cell]
-                    cells[cell].completed_steps = Int(mapped_steps[cell])
-                    cells[cell].stats.internal_steps = Int(mapped_stats[cell])
-                    cells[cell].stats.rhs_calls = Int(mapped_stats[num_cells + cell])
-                    cells[cell].stats.jacobian_calls = Int(mapped_stats[2 * num_cells + cell])
-                    cells[cell].stats.decompositions = Int(mapped_stats[3 * num_cells + cell])
-                    cells[cell].stats.linear_solves = Int(mapped_stats[4 * num_cells + cell])
-                    cells[cell].stats.accepted_steps = Int(mapped_stats[5 * num_cells + cell])
-                    cells[cell].stats.rejected_steps = Int(mapped_stats[6 * num_cells + cell])
-    print("Primordial chemistry collapse grid with ROS2S")
-    print("backend: mojo-gpu-dataparallel")
-    print("grid:", options.grid_dim, "^3 (", num_cells, "cells )")
-    print("driver policy: gridwide-cta32")
-    print("completed global collapse steps:", completed_global_steps)
-    print("wall time:", elapsed, "s")
-    if options.compare_final_state_path != "":
-        if not reproducer.compare_final_states_from_file(
-            cells,
-            options.grid_dim,
-            options.compare_final_state_path,
-            reproducer.GridwideCta32Policy,
-        ):
-            raise Error("final-state comparison failed")
-    if options.write_final_state_path != "":
-        reproducer.write_final_states(
-            cells,
-            options.grid_dim,
-            options.write_final_state_path,
-            reproducer.GridwideCta32Policy,
-        )

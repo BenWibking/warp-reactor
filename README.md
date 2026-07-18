@@ -3,6 +3,21 @@
 `reproducer.cpp` is a standalone translation unit for the primordial chemistry
 collapse-grid reproducer. Run the commands below from this directory.
 
+## Repository layout
+
+- `apps/` contains the thin Mojo GPU executable entry points.
+- `src/gpu/` owns the shared grid-wide host lifecycle and GPU kernels.
+- `tests/gpu/` and `tests/integration/` contain GPU and cross-policy tests.
+- `tools/` contains code generation and numerical probes.
+- `benchmarks/` contains machine-specific measurement jobs.
+- `docs/performance/` contains optimization hypotheses, ideas, and results;
+  `DESIGN.md` remains the canonical implementation roadmap.
+
+Both Mojo GPU executables use the same grid-wide runner. The data-parallel and
+structured chemistry kernels are adapters selected at compile time, so buffer
+management, timestep reduction, failure handling, copy-back, and final-state
+comparison have one implementation.
+
 ## Table of results
 
 | ROCm version | runtime (s) | target | sgpr_count | vgpr_count | sgpr_spill_count | vgpr_spill_count | agpr_count | private_segment_fixed_size |
@@ -28,6 +43,24 @@ Mojo CPU build:
 
 ```bash
 pixi run mojo build reproducer.mojo -o reproducer_mojo -Xlinker -lm
+```
+
+Mojo GPU builds (on a CUDA-capable machine):
+
+```bash
+pixi run build-gpu
+pixi run build-structured-gpu
+```
+
+The Pixi tasks generate the structured chemistry DAG sources and build the
+entry points under `apps/` with `src/gpu/` on the Mojo import path.
+
+Compile the focused GPU tests on the GPU machine with:
+
+```bash
+pixi run build-test-structured-dag
+pixi run build-test-structured-trial
+pixi run build-test-warp-lu
 ```
 
 CUDA build with the default project settings:
