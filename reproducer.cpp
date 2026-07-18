@@ -7793,14 +7793,25 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                                              int& completed_global_steps) {
     CollapseState* device_cells = nullptr;
     integrators::Real* device_dt_candidates = nullptr;
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    integrators::Real* device_jacobian_cache = nullptr;
+#endif
     int* device_integrated_count = nullptr;
     int* device_failure = nullptr;
     const auto bytes = cells.size() * sizeof(CollapseState);
     const auto candidate_bytes = cells.size() * sizeof(integrators::Real);
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    const auto jacobian_cache_bytes =
+        cells.size() * structured_cuda::kMatrixValues * sizeof(integrators::Real);
+#endif
 
     if (!check_cuda(cudaMalloc(&device_cells, bytes), "cudaMalloc(cells)") ||
         !check_cuda(cudaMalloc(&device_dt_candidates, candidate_bytes),
                     "cudaMalloc(dt_candidates)") ||
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+        !check_cuda(cudaMalloc(&device_jacobian_cache, jacobian_cache_bytes),
+                    "cudaMalloc(jacobian_cache)") ||
+#endif
         !check_cuda(cudaMalloc(&device_integrated_count, sizeof(int)),
                     "cudaMalloc(integrated_count)") ||
         !check_cuda(cudaMalloc(&device_failure, sizeof(int)), "cudaMalloc(failure)") ||
@@ -7808,6 +7819,9 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
                     "cudaMemcpy(cells to device)")) {
         cudaFree(device_cells);
         cudaFree(device_dt_candidates);
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+        cudaFree(device_jacobian_cache);
+#endif
         cudaFree(device_integrated_count);
         cudaFree(device_failure);
         return integrators::IntegratorResult::BAD_INPUTS;
@@ -7898,8 +7912,8 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
             <<<structured_grid_size, structured_cuda::kBlockThreads,
                structured_cuda::kSharedBytes>>>(
                 device_cells, num_cells, completed_global_steps, grid_time,
-                next_grid_time, dt_grid, device_integrated_count,
-                device_failure);
+                next_grid_time, dt_grid, device_jacobian_cache,
+                device_integrated_count, device_failure);
         constexpr const char* advance_launch =
             "advance_collapse_gridwide_structured_kernel launch";
         constexpr const char* advance_sync =
@@ -7952,6 +7966,9 @@ integrators::IntegratorResult run_cells_cuda(std::vector<CollapseState>& cells,
 
     cudaFree(device_cells);
     cudaFree(device_dt_candidates);
+#if defined(PRIMORDIAL_ROS2S_CUDA_STRUCTURED)
+    cudaFree(device_jacobian_cache);
+#endif
     cudaFree(device_integrated_count);
     cudaFree(device_failure);
     return result;

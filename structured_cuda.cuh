@@ -394,7 +394,7 @@ __global__ __launch_bounds__(kBlockThreads, 1)
 void advance_collapse_gridwide_structured_kernel(
     CollapseState* cells, int num_cells, int completed_global_steps,
     double grid_time, double next_grid_time, double dt_grid,
-    int* integrated_count, int* failure_code) {
+    double* jacobian_cache, int* integrated_count, int* failure_code) {
     extern __shared__ __align__(16) unsigned char raw_shared[];
     auto& shared = *reinterpret_cast<SharedStorage*>(raw_shared);
 
@@ -492,6 +492,10 @@ void advance_collapse_gridwide_structured_kernel(
     int n_step = 0;
     int n_accept = 0;
     int status = static_cast<int>(integrators::IntegratorResult::SUCCESS);
+    // LU factorization overwrites shared.jacobian.  A rejected trial keeps the
+    // same base state and substep time, so retain the raw Jacobian until a
+    // trial is accepted and advances both.
+    bool jacobian_valid = false;
     const bool participating =
         warp_cell < active_cells && shared.participants[warp_cell] > 0;
 
@@ -521,22 +525,41 @@ void advance_collapse_gridwide_structured_kernel(
         }
         __syncthreads();
 
+        const bool reuse_jacobian = jacobian_valid;
         prepare_dag_inputs(shared.base, shared.dag_inputs, tid, active_cells);
-        evaluate_base(shared, physical_warp, physical_lane, active_cells);
+        if (reuse_jacobian) {
+            evaluate_rhs(shared, physical_warp, physical_lane, active_cells);
+        } else {
+            evaluate_base(shared, physical_warp, physical_lane, active_cells);
+            if (tid == 0) {
+                ++shared.control_i32[2];
+            }
+        }
 
         if (participating) {
+            const int global_cell = tile_begin + warp_cell;
             for (int column = local_lane; column < kEquations;
                  column += kLuGroupWidth) {
                 for (int row = 0; row < kEquations; ++row) {
                     const int index =
                         warp_cell * kMatrixValues + row * kEquations + column;
-                    shared.jacobian[index] = -shared.jacobian[index];
+                    const std::size_t cache_index =
+                        static_cast<std::size_t>(global_cell) * kMatrixValues +
+                        row * kEquations + column;
+                    const double raw_jacobian =
+                        reuse_jacobian ? jacobian_cache[cache_index]
+                                       : shared.jacobian[index];
+                    if (!reuse_jacobian) {
+                        jacobian_cache[cache_index] = raw_jacobian;
+                    }
+                    shared.jacobian[index] = -raw_jacobian;
                     if (row == column) {
                         shared.jacobian[index] += 1.0 / (h * gamma);
                     }
                 }
             }
         }
+        jacobian_valid = true;
         __syncthreads();
         factorize_shared(shared.jacobian, participating, warp_cell, local_lane,
                          shared.pivots, shared.infos);
@@ -641,9 +664,6 @@ void advance_collapse_gridwide_structured_kernel(
         __syncthreads();
 
         if (shared.control_i32[1] != 0) {
-            if (tid == 0) {
-                ++shared.control_i32[2];
-            }
             ++nsing;
             if (nsing >= 5) {
                 status = static_cast<int>(
@@ -705,6 +725,7 @@ void advance_collapse_gridwide_structured_kernel(
             }
             reject = false;
             h = hnew;
+            jacobian_valid = false;
         } else {
             if (tid == 0 && n_accept >= 1) {
                 ++shared.control_i32[3];
@@ -737,7 +758,7 @@ void advance_collapse_gridwide_structured_kernel(
             collapse.stats.internal_steps += static_cast<std::uint64_t>(n_step);
             collapse.stats.rhs_calls += static_cast<std::uint64_t>(3 * n_step);
             collapse.stats.jacobian_calls +=
-                static_cast<std::uint64_t>(n_step + shared.control_i32[2]);
+                static_cast<std::uint64_t>(shared.control_i32[2]);
             collapse.stats.decompositions += static_cast<std::uint64_t>(n_step);
             collapse.stats.linear_solves += static_cast<std::uint64_t>(3 * n_step);
             collapse.stats.accepted_steps += static_cast<std::uint64_t>(n_accept);
