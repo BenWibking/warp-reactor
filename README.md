@@ -3,6 +3,21 @@
 `reproducer.cpp` is a standalone translation unit for the primordial chemistry
 collapse-grid reproducer. Run the commands below from this directory.
 
+## Repository layout
+
+- `apps/` contains the thin Mojo GPU executable entry points.
+- `src/gpu/` owns the shared grid-wide host lifecycle and GPU kernels.
+- `tests/gpu/` and `tests/integration/` contain GPU and cross-policy tests.
+- `tools/` contains code generation and numerical probes.
+- `benchmarks/` contains machine-specific measurement jobs.
+- `docs/performance/` contains optimization hypotheses, ideas, and results;
+  `DESIGN.md` remains the canonical implementation roadmap.
+
+Both Mojo GPU executables use the same grid-wide runner. The data-parallel and
+structured chemistry kernels are adapters selected at compile time, so buffer
+management, timestep reduction, failure handling, copy-back, and final-state
+comparison have one implementation.
+
 ## Table of results
 
 | ROCm version | runtime (s) | target | sgpr_count | vgpr_count | sgpr_spill_count | vgpr_spill_count | agpr_count | private_segment_fixed_size |
@@ -30,11 +45,43 @@ Mojo CPU build:
 pixi run mojo build reproducer.mojo -o reproducer_mojo -Xlinker -lm
 ```
 
+Mojo GPU builds (on a CUDA-capable machine):
+
+```bash
+pixi run build-gpu
+pixi run build-structured-gpu
+```
+
+The Pixi tasks generate the structured chemistry DAG sources and build the
+entry points under `apps/` with `src/gpu/` on the Mojo import path.
+
+Compile the focused GPU tests on the GPU machine with:
+
+```bash
+pixi run build-test-structured-dag
+pixi run build-test-structured-trial
+pixi run build-test-warp-lu
+```
+
 CUDA build with the default project settings:
 
 ```bash
 nvcc -x cu -std=c++20 -O3 -arch=sm_90 --expt-relaxed-constexpr --fmad=false --maxrregcount=255 -DPRIMORDIAL_ROS2S_ENABLE_CUDA -DPRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK=128 -I. reproducer.cpp -o reproducer_cuda
 ```
+
+Pure-CUDA port of the Hopper structured kernel:
+
+```bash
+python3 tools/slice_dag.py
+nvcc -x cu -std=c++20 -O3 -arch=sm_90 --expt-relaxed-constexpr --fmad=false --maxrregcount=255 -DPRIMORDIAL_ROS2S_ENABLE_CUDA -DPRIMORDIAL_ROS2S_CUDA_STRUCTURED -DPRIMORDIAL_ROS2S_CUDA_THREADS_PER_BLOCK=128 -I. reproducer.cpp -o reproducer_cuda_structured
+```
+
+This variant preserves the Mojo structured kernel's 32-cell, 256-thread CTA,
+two-wave chemistry DAG, shared-memory staging, four 8-lane LU groups per
+warp, and tile-wide adaptive controller. It uses 230,576 bytes of dynamic
+shared memory and therefore targets Hopper-class GPUs with the 227 KiB
+opt-in shared-memory configuration. Output identifies the policy as
+`gridwide-structured-cta32`.
 
 HIP build with the default project settings:
 
@@ -72,6 +119,14 @@ Run the CUDA reproducer:
 ./reproducer_cuda
 ```
 
+The CUDA/HIP driver uses a grid-wide outer physical timestep. A preparation
+kernel applies the scheduled perturbation and publishes each eligible cell's
+free-fall timestep; the host selects the global minimum, and the advance
+kernel integrates every participating cell over that same interval. Each GPU
+thread still owns an independent ROS2S controller, including its own error
+estimate, accepted/rejected substeps, and retry history. Output identifies
+this policy as `gridwide-independent`.
+
 Run the HIP reproducer:
 
 ```bash
@@ -86,9 +141,12 @@ Show the available options:
 ./reproducer --help
 ```
 
-By default, the run uses a `64^3` cell grid, enables deterministic density
-perturbations, and compares the final state against
-`final_states_grid64_cpu.bin`. To run without any reference comparison:
+By default, every backend uses a `64^3` cell grid and enables deterministic
+density perturbations. The CPU run compares against
+`final_states_grid64_cpu.bin`. CUDA/HIP do not select a reference by default
+because their `gridwide-independent` policy is not compatible with the legacy
+local-timestep CPU reference. Use `--compare-final-state FILE` with a reference
+generated for the same policy. To explicitly run without comparison:
 
 ```bash
 ./reproducer --no-compare-final-state

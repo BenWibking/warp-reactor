@@ -1,14 +1,23 @@
 [workspace]
 authors = ["Ben Wibking <wibkingb@msu.edu>"]
-channels = ["https://conda.modular.com/max", "conda-forge"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
 name = "mojo-chemistry"
-platforms = ["linux-64"]
+platforms = ["linux-64", "osx-arm64"]
 version = "0.1.0"
 
 [tasks]
 build-mojo = "mojo build reproducer.mojo -o reproducer_mojo -Xlinker -lm"
 run-mojo-grid1 = { cmd = "./reproducer_mojo --grid 1 --no-compare-final-state", depends-on = ["build-mojo"] }
+generate-dag = "python3 tools/slice_dag.py"
+build-gpu = { cmd = "mojo build -I . -I src/gpu apps/reproducer_gpu.mojo -o reproducer_gpu", depends-on = ["generate-dag"] }
+build-structured-gpu = { cmd = "mojo build -I . -I src/gpu apps/reproducer_structured_gpu.mojo -o reproducer_structured_gpu", depends-on = ["generate-dag"] }
+build-test-structured-dag = { cmd = "mojo build -I . -I src/gpu tests/gpu/test_structured_dag.mojo -o test_structured_dag", depends-on = ["generate-dag"] }
+build-test-structured-trial = { cmd = "mojo build -I . -I src/gpu tests/gpu/test_structured_trial.mojo -o test_structured_trial", depends-on = ["generate-dag"] }
+build-test-warp-lu = "mojo build -I . -I src/gpu tests/gpu/test_warp_lu.mojo -o test_warp_lu"
+test-grid-timestep = "mojo run -I . tests/integration/test_grid_timestep_reference.mojo"
+test-slice-dag-python = "python3 -m unittest tests/test_slice_dag.py"
+test-slice-dag-mojo = { cmd = "mojo run -I . tests/test_slice_dag.mojo", depends-on = ["generate-dag"] }
 probe-transcendentals = "python3 tools/transcendental_probe.py"
 
 [dependencies]
-mojo = ">=1.0.0b2,<2"
+mojo = ">=1.0.0b3.dev2026071705,<2"
